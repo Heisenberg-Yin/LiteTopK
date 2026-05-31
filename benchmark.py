@@ -29,6 +29,7 @@ from flashlargek import flash_knn_triton_flashlargek
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_BASE = os.path.join(os.path.dirname(_HERE), "base.fvecs")
+_DEFAULT_QUERY = os.path.join(os.path.dirname(_HERE), "query.fvecs")
 
 
 def read_fvecs(filename: str, limit=None) -> np.ndarray:
@@ -102,8 +103,8 @@ def main():
     N = min(args.num_queries, M)
     k = min(args.k, M)
     Q = X[:N].contiguous()                                   # queries = first N rows
-    x = Q.unsqueeze(0)                                        # (1, N, D)
-    c = X.unsqueeze(0)                                        # (1, M, D)
+    x = Q                                                     # (N, D)
+    c = X                                                     # (M, D)
     print(f"M={M} N={N} D={D} k={k}  X={X.element_size()*X.numel()/1e9:.2f} GB")
 
     fn = lambda: flash_knn_triton_flashlargek(x, c, k, return_distances=True)
@@ -119,7 +120,7 @@ def main():
 
     if args.recall_queries > 0:
         S = min(args.recall_queries, N)
-        rec = _exact_recall(Q[:S], X, idxs[0, :S], k)
+        rec = _exact_recall(Q[:S], X, idxs[:S], k)
         print(f"recall@{k} (exact brute-force on first {S} queries) = {rec:.5f}")
 
 

@@ -231,7 +231,6 @@ def _sample_range_per_row(
     ``min(M, max(k, 16384))`` corpus rows, using ``s = ‖c‖² − 2⟨x,c⟩``. The true
     full-corpus k-th smallest is ≤ the sample's, so it sits inside the range.
     Returns ``(bucket_origin, bucket_inv_delta)`` of shape ``(N,)``."""
-    N, _ = x.shape
     M = c.shape[0]
     # S must be ≥ k: the range max is the sample's k-th smallest, and only with
     # S ≥ k does the subset argument (true k-th ≤ sample k-th) hold, so the range

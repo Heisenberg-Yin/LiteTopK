@@ -57,8 +57,12 @@ def _row_sq_kernel(
 
 
 def _fast_row_sq(x: torch.Tensor) -> torch.Tensor:
-    """Return ``(B, N)`` fp32 row sum-of-squares via the Triton kernel."""
-    assert x.is_cuda and x.ndim == 3
+    """Row sum-of-squares via the Triton kernel. Accepts ``(B, N, D)`` →
+    ``(B, N)`` or ``(N, D)`` → ``(N,)`` (treated as a single batch)."""
+    assert x.is_cuda and x.ndim in (2, 3)
+    squeeze = x.ndim == 2
+    if squeeze:
+        x = x.unsqueeze(0)
     B, N, D = x.shape
     out = torch.empty(B, N, device=x.device, dtype=torch.float32)
     BN = 128 if N >= 128 else _next_pow2(max(N, 16))
@@ -71,7 +75,7 @@ def _fast_row_sq(x: torch.Tensor) -> torch.Tensor:
         B=B, N=N, D=D, BN=BN, BD=BD,
         num_warps=4,
     )
-    return out
+    return out.squeeze(0) if squeeze else out
 
 
 # Per-data-ptr cache so repeated queries on the same corpus don't pay
