@@ -43,9 +43,9 @@ def main():
     X = torch.from_numpy(read_fvecs(args.base, limit=args.num_base)).to(device).float()
     Q = torch.from_numpy(read_fvecs(args.query)).to(device).float()
     M, D = X.shape
-    B = min(args.batch_size, Q.shape[0])
+    B = args.batch_size
     k = min(args.k, M)
-    x = Q[:B].contiguous()  # queries from query.fvecs
+    x = Q[torch.arange(B, device=device) % Q.shape[0]].contiguous()  # tile to fill bs
     c = X  # corpus
     assert x.shape[1] == D, f"query dim {x.shape[1]} != corpus dim {D}"
     print(f"M={M} D={D} batch_size={B} (of {Q.shape[0]} queries) k={k}")

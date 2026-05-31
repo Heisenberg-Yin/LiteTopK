@@ -94,6 +94,8 @@ def _flashlargek_fused_kernel(
     D_INNER: tl.constexpr,
     NUM_BUCKETS: tl.constexpr,
     NUM_STAGES_PIPE: tl.constexpr = 2,
+    PROFILE_STAGE: tl.constexpr = 3,  # 1=matmul+hist, 2=+threshold, 3=+writeback (full)
+    THRESH_EVERY: tl.constexpr = 1,  # only pid_m % THRESH_EVERY == 0 recomputes the gate
 ):
     """One pass over [BN queries × BM corpus]: score → bucket → hist + writeback.
 
@@ -170,53 +172,64 @@ def _flashlargek_fused_kernel(
 
     # streaming threshold: re-derive the gate from the (partial) histogram and
     # fold it in with atomic_min (it only tightens; stays ≥ the final T).
-    bkt = tl.arange(0, NUM_BUCKETS)
-    hrow = tl.load(
-        bcount_ptr
-        + n_offs[:, None] * stride_bc_n
-        + bkt[None, :] * stride_bc_k,
-        mask=n_mask[:, None],
-        other=0,
-    ).to(
-        tl.int32
-    )  # (BN, NUM_BUCKETS)
-    cum = tl.cumsum(hrow, axis=1)
-    reached = cum >= K
-    cand_b = tl.where(reached, bkt[None, :], NUM_BUCKETS)
-    my_thr = tl.min(cand_b, axis=1)
-    my_thr = tl.minimum(my_thr, NUM_BUCKETS - 1).to(tl.int32)
-    th_off = n_offs * stride_t_n
-    old_thr = tl.atomic_min(threshold_ptr + th_off, my_thr, sem="relaxed", mask=n_mask)
-    gate = tl.minimum(old_thr, my_thr)
+    gate = tl.full([BN], NUM_BUCKETS - 1, dtype=tl.int32)
+    if PROFILE_STAGE >= 2:
+        bkt = tl.arange(0, NUM_BUCKETS)
+        hrow = tl.load(
+            bcount_ptr
+            + n_offs[:, None] * stride_bc_n
+            + bkt[None, :] * stride_bc_k,
+            mask=n_mask[:, None],
+            other=0,
+        ).to(
+            tl.int32
+        )  # (BN, NUM_BUCKETS)
+        cum = tl.cumsum(hrow, axis=1)
+        reached = cum >= K
+        cand_b = tl.where(reached, bkt[None, :], NUM_BUCKETS)
+        my_thr = tl.min(cand_b, axis=1)
+        my_thr = tl.minimum(my_thr, NUM_BUCKETS - 1).to(tl.int32)
+        th_off = n_offs * stride_t_n
+        old_thr = tl.atomic_min(
+            threshold_ptr + th_off, my_thr, sem="relaxed", mask=n_mask
+        )
+        gate = tl.minimum(old_thr, my_thr)
 
     # writeback into the per-(row, bucket) region (k slots/bucket)
-    store_mask = valid & (bucket_i <= gate[:, None]) & (slot < K_CAP)
-    cv_off = (
-        n_offs[:, None] * stride_cv_n
-        + bucket_i * stride_cv_k
-        + slot * stride_cv_s
-    )
-    ci_off = (
-        n_offs[:, None] * stride_ci_n
-        + bucket_i * stride_ci_k
-        + slot * stride_ci_s
-    )
-    tl.store(cand_val_ptr + cv_off, score, mask=store_mask)
-    tl.store(cand_idx_ptr + ci_off, m_offs[None, :].to(tl.int32), mask=store_mask)
+    if PROFILE_STAGE >= 3:
+        store_mask = valid & (bucket_i <= gate[:, None]) & (slot < K_CAP)
+        cv_off = (
+            n_offs[:, None] * stride_cv_n
+            + bucket_i * stride_cv_k
+            + slot * stride_cv_s
+        )
+        ci_off = (
+            n_offs[:, None] * stride_ci_n
+            + bucket_i * stride_ci_k
+            + slot * stride_ci_s
+        )
+        tl.store(cand_val_ptr + cv_off, score, mask=store_mask)
+        tl.store(cand_idx_ptr + ci_off, m_offs[None, :].to(tl.int32), mask=store_mask)
 
 
 # ────────────────────────── host driver ────────────────────────────────
 
 
 def _heuristic_flashlargek_config(*, N: int, M: int, D: int) -> dict:
-    """Shape-only heuristic. BN is capped at 64 (the streaming pass holds a
-    ``[BN, 256]`` cumsum tile per program); more num_warps spreads it."""
+    """Shape-only heuristic covering query counts N = 1 .. 1024 (and beyond —
+    the host streams queries in chunks of BN, so any N is handled by looping).
+
+    ``BN`` (the query tile) is a power of two, **floored at 16** (tensor-core
+    ``tl.dot`` needs the M/N/K dims ≥ 16) and **capped at 64** (the streaming
+    threshold pass holds a ``[BN, 256]`` cumsum tile per program; larger BN
+    blows shared memory). So N=1..16→16, 17..32→32, ≥33 (incl. 64/256/1024)→64.
+    """
     if N <= 16:
         BN = 16
     elif N <= 32:
         BN = 32
     else:
-        BN = 64
+        BN = 64  # N = 64, 256, 1024, ... all chunk into 64-query tiles
     BM = 64 if D >= 256 else 128
     D_INNER = _next_pow2(D) if D <= 64 else 64
     return dict(BN=BN, BM=BM, D_INNER=D_INNER, num_warps=8, num_stages_pipe=2)
@@ -345,21 +358,22 @@ def flash_knn_triton_flashlargek(
     assert 1 <= k <= M, f"k must be in [1, M={M}], got {k}"
     device = x.device
 
-    c = c.contiguous()
-    bucket_origin, bucket_inv_delta = _sample_range_per_row(x, c, k)
-
+    # Pick the launch config and run the int32-offset guard FIRST — before any
+    # GPU work (sampling / matmul) — so an out-of-range shape fails fast.
     cfg = _heuristic_flashlargek_config(N=N, M=M, D=D)
     BN, BM, D_INNER = cfg["BN"], cfg["BM"], cfg["D_INNER"]
     CHUNK = BN
     K_CAP = k  # k slots / bucket
-
-    # The kernel uses int32 addressing: every tensor offset must stay < 2**31.
-    # Largest are the corpus (M·D) and the cand buffer (BN·256·K_CAP). Holds for
-    # M ≲ 2.79M at D=768 and k ≲ 131072 at BN=64.
+    # int32 addressing: every tensor offset must stay < 2**31. Largest are the
+    # corpus (M·D) and the cand buffer (BN·256·K_CAP). Holds for M ≲ 2.79M at
+    # D=768 and k ≲ 131072 at BN=64.
     assert M * D < 2**31 and BN * _NUM_BUCKETS * K_CAP < 2**31, (
         f"int32 offsets would overflow (M*D={M * D}, "
         f"BN*256*K_CAP={BN * _NUM_BUCKETS * K_CAP}); restore int64 addressing"
     )
+
+    c = c.contiguous()
+    bucket_origin, bucket_inv_delta = _sample_range_per_row(x, c, k)
 
     out_idxs = torch.empty((N, k), device=device, dtype=torch.int32)
     out_shift = (
@@ -379,6 +393,7 @@ def flash_knn_triton_flashlargek(
     )
 
     verbose = os.environ.get("FLASHLARGEK_VERBOSE") == "1"
+    profile_stage = int(os.environ.get("FLASHLARGEK_PROFILE_STAGE", "3"))  # ablation
     grid_m = math.ceil(M / BM)
 
     for q0 in range(0, N, CHUNK):
@@ -431,6 +446,7 @@ def flash_knn_triton_flashlargek(
             D_INNER=D_INNER,
             NUM_BUCKETS=_NUM_BUCKETS,
             NUM_STAGES_PIPE=cfg["num_stages_pipe"],
+            PROFILE_STAGE=profile_stage,
             num_warps=cfg["num_warps"],
         )
 

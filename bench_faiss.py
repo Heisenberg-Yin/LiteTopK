@@ -13,6 +13,7 @@ Run with the python10 env (faiss-gpu-cu12 installed there):
     /mnt/hdd/yinziqi/miniconda3/envs/python10/bin/python \\
         efficientlargek/bench_faiss.py --batch-size 64 --k 2048
 """
+
 from __future__ import annotations
 
 import argparse
@@ -46,9 +47,9 @@ def main():
     X = torch.from_numpy(read_fvecs(args.base, limit=args.num_base)).to(device).float()
     Q = torch.from_numpy(read_fvecs(args.query)).to(device).float()
     M, D = X.shape
-    B = min(args.batch_size, Q.shape[0])
+    B = args.batch_size
     k = min(args.k, M)
-    x = Q[:B].contiguous()  # queries from query.fvecs
+    x = Q[torch.arange(B, device=device) % Q.shape[0]].contiguous()  # tile to fill bs
     c = X.contiguous()  # corpus
     assert x.shape[1] == D, f"query dim {x.shape[1]} != corpus dim {D}"
     print(f"M={M} D={D} batch_size={B} (of {Q.shape[0]} queries) k={k}")
@@ -62,8 +63,12 @@ def main():
         return Dout, Iout
 
     torch.cuda.reset_peak_memory_stats()
-    _time_cuda(fn, warmup=args.warmup, iters=args.iters,
-               label=f"faiss.knn_gpu B={B} M={M} k={k}")
+    _time_cuda(
+        fn,
+        warmup=args.warmup,
+        iters=args.iters,
+        label=f"faiss.knn_gpu B={B} M={M} k={k}",
+    )
     print(f"peak GPU mem = {torch.cuda.max_memory_allocated()/1e9:.2f} GB")
 
 
