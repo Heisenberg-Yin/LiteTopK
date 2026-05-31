@@ -25,16 +25,21 @@ from benchmark import _DEFAULT_BASE, _DEFAULT_QUERY, _time_cuda, read_fvecs
 
 
 @torch.no_grad()
-def matmul_raft_topk(x, c, k, handle, out_dist, out_idx):
+def matmul_raft_topk(x, c, k, handle):
     """``(B,D)``×``(M,D)`` → top-k smallest squared-L2 per query via RAFT.
 
     ``csq = ‖c‖²`` is computed here (inside the timed region) so the
     corpus-side preprocessing is counted, matching the other two baselines.
+    The output buffers are also allocated here (inside the timed region) so
+    output allocation is counted the same way torch.topk and flashlargek do.
     ``out_dist`` is the *true* squared-L2 distance ``‖x−c‖² = s + ‖x‖²``,
     recovered from the shifted score ``s = ‖c‖² − 2⟨x,c⟩`` (same as flashlargek)."""
+    B = x.shape[0]
     csq = (c * c).sum(dim=-1)                       # ‖c‖²
     cross = torch.matmul(x, c.t())                  # (B, M)
     score = (csq.unsqueeze(0) - 2.0 * cross).contiguous()
+    out_dist = torch.empty(B, k, device=x.device, dtype=torch.float32)
+    out_idx = torch.empty(B, k, device=x.device, dtype=torch.int64)
     select_k(score, k=k, distances=out_dist, indices=out_idx,
              select_min=True, handle=handle)
     handle.sync()
@@ -69,10 +74,8 @@ def main():
     print(f"M={M} D={D} batch_size={B} (of {Q.shape[0]} queries) k={k}")
 
     handle = DeviceResources()
-    out_dist = torch.empty(B, k, device=device, dtype=torch.float32)
-    out_idx = torch.empty(B, k, device=device, dtype=torch.int64)
 
-    fn = lambda: matmul_raft_topk(x, c, k, handle, out_dist, out_idx)
+    fn = lambda: matmul_raft_topk(x, c, k, handle)
 
     torch.cuda.reset_peak_memory_stats()
     _time_cuda(fn, warmup=args.warmup, iters=args.iters,

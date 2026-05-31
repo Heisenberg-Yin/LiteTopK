@@ -52,7 +52,6 @@ import triton
 import triton.language as tl
 
 from _common import _next_pow2
-from _row_norm import _get_or_compute_csq
 
 _NUM_BUCKETS = 256
 _BUCKET_EPS = 1.0e-20
@@ -65,7 +64,6 @@ _BUCKET_EPS = 1.0e-20
 def _flashlargek_fused_kernel(
     x_ptr,
     c_ptr,
-    csq_ptr,
     origin_ptr,
     inv_delta_ptr,
     bcount_ptr,
@@ -76,7 +74,6 @@ def _flashlargek_fused_kernel(
     stride_x_d,
     stride_c_m,
     stride_c_d,
-    stride_csq_m,
     stride_o_n,
     stride_bc_n,
     stride_bc_k,
@@ -111,14 +108,16 @@ def _flashlargek_fused_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    n_offs = (pid_n * BN + tl.arange(0, BN)).to(tl.int64)
+    # int32 addressing (host asserts every offset stays < 2**31)
+    n_offs = pid_n * BN + tl.arange(0, BN)
     n_mask = n_offs < N
-    m_offs = (pid_m * BM + tl.arange(0, BM)).to(tl.int64)
+    m_offs = pid_m * BM + tl.arange(0, BM)
     m_mask = m_offs < M
 
-    # ── score = ‖c‖² − 2⟨x,c⟩ (single matmul) ──
+    # ── score = ‖c‖² − 2⟨x,c⟩ : single corpus pass. ‖c‖² is accumulated from the
+    # SAME c tiles already loaded for the matmul (no separate corpus read). ──
     if D_INNER >= D:
-        d_offs = tl.arange(0, D_INNER).to(tl.int64)
+        d_offs = tl.arange(0, D_INNER)
         d_mask = d_offs < D
         x_tile = tl.load(
             x_ptr + n_offs[:, None] * stride_x_n + d_offs[None, :] * stride_x_d,
@@ -131,10 +130,13 @@ def _flashlargek_fused_kernel(
             other=0.0,
         )
         cross = tl.dot(x_tile, tl.trans(c_tile)).to(tl.float32)
+        c_f = c_tile.to(tl.float32)
+        csq = tl.sum(c_f * c_f, axis=1)  # (BM,)
     else:
         cross = tl.zeros([BN, BM], dtype=tl.float32)
+        csq = tl.zeros([BM], dtype=tl.float32)
         for d_start in range(0, D, D_INNER):
-            d_offs = (d_start + tl.arange(0, D_INNER)).to(tl.int64)
+            d_offs = d_start + tl.arange(0, D_INNER)
             d_mask = d_offs < D
             x_sub = tl.load(
                 x_ptr + n_offs[:, None] * stride_x_n + d_offs[None, :] * stride_x_d,
@@ -147,8 +149,9 @@ def _flashlargek_fused_kernel(
                 other=0.0,
             )
             cross += tl.dot(x_sub, tl.trans(c_sub)).to(tl.float32)
+            c_f = c_sub.to(tl.float32)
+            csq += tl.sum(c_f * c_f, axis=1)
 
-    csq = tl.load(csq_ptr + m_offs * stride_csq_m, mask=m_mask, other=0.0)
     score = csq[None, :] - 2.0 * cross
 
     origin = tl.load(origin_ptr + n_offs * stride_o_n, mask=n_mask, other=0.0)
@@ -162,9 +165,8 @@ def _flashlargek_fused_kernel(
     valid = n_mask[:, None] & m_mask[None, :] & in_range
 
     # histogram + slot counter (one atomic): slot = pre-increment value
-    bc_off = n_offs[:, None] * stride_bc_n + bucket_i.to(tl.int64) * stride_bc_k
+    bc_off = n_offs[:, None] * stride_bc_n + bucket_i * stride_bc_k
     slot = tl.atomic_add(bcount_ptr + bc_off, 1, sem="relaxed", mask=valid)
-    slot = slot.to(tl.int64)
 
     # streaming threshold: re-derive the gate from the (partial) histogram and
     # fold it in with atomic_min (it only tightens; stays ≥ the final T).
@@ -172,7 +174,7 @@ def _flashlargek_fused_kernel(
     hrow = tl.load(
         bcount_ptr
         + n_offs[:, None] * stride_bc_n
-        + bkt[None, :].to(tl.int64) * stride_bc_k,
+        + bkt[None, :] * stride_bc_k,
         mask=n_mask[:, None],
         other=0,
     ).to(
@@ -191,12 +193,12 @@ def _flashlargek_fused_kernel(
     store_mask = valid & (bucket_i <= gate[:, None]) & (slot < K_CAP)
     cv_off = (
         n_offs[:, None] * stride_cv_n
-        + bucket_i.to(tl.int64) * stride_cv_k
+        + bucket_i * stride_cv_k
         + slot * stride_cv_s
     )
     ci_off = (
         n_offs[:, None] * stride_ci_n
-        + bucket_i.to(tl.int64) * stride_ci_k
+        + bucket_i * stride_ci_k
         + slot * stride_ci_s
     )
     tl.store(cand_val_ptr + cv_off, score, mask=store_mask)
@@ -224,7 +226,6 @@ def _heuristic_flashlargek_config(*, N: int, M: int, D: int) -> dict:
 def _sample_range_per_row(
     x: torch.Tensor,
     c: torch.Tensor,
-    csq: torch.Tensor,
     k: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-query bucket range ``[min, k-th smallest]`` from the first
@@ -239,17 +240,22 @@ def _sample_range_per_row(
     S = min(M, max(k, 16384))
     k_eff = min(k, S)  # == k since S ≥ k
 
-    c_sample = c[:S, :].contiguous()
-    csq_sample = csq[:S]
-    cross = torch.matmul(x.float(), c_sample.float().t())  # (N, S)
+    cs = c[:S, :].float()
+    csq_sample = (cs * cs).sum(dim=-1)  # (S,) — computed on the slice only
+    cross = torch.matmul(x.float(), cs.t())  # (N, S)
     s_sample = csq_sample.unsqueeze(0) - 2.0 * cross
 
+    # We only need two order statistics per row: the minimum (range floor) and
+    # the k_eff-th smallest (range ceiling) — never a full ordering.
     if k_eff < S:
-        vals = torch.topk(s_sample, k=k_eff, dim=-1, largest=False, sorted=True).values
-    else:
-        vals, _ = s_sample.sort(dim=-1)
-    min_score = vals[..., 0]
-    max_score = vals[..., k_eff - 1]
+        # the k_eff smallest values; their min is the global min and their max
+        # is the k_eff-th smallest. sorted=False: order inside the set is unused.
+        vals = torch.topk(s_sample, k=k_eff, dim=-1, largest=False, sorted=False).values
+        min_score = vals.amin(dim=-1)
+        max_score = vals.amax(dim=-1)
+    else:  # k_eff == S: the whole sample is the top-k → just its min and max
+        min_score = s_sample.amin(dim=-1)
+        max_score = s_sample.amax(dim=-1)
     span = torch.clamp(max_score - min_score, min=_BUCKET_EPS)
     # Use (NUM_BUCKETS-1)/span so the range max (the k-th smallest) lands on the
     # last valid bucket 255, not bucket 256 which in_range would drop. Matters
@@ -313,7 +319,7 @@ def _gather_topk_chunk(
     packed_v = torch.where(valid, flat_v.gather(1, gidx), torch.inf)
     packed_i = flat_i.gather(1, gidx)
 
-    topv, topp = torch.topk(packed_v, k=k, dim=-1, largest=False, sorted=True)
+    topv, topp = torch.topk(packed_v, k=k, dim=-1, largest=False, sorted=False)
     topi = torch.gather(packed_i, 1, topp)
     return topv, topi
 
@@ -340,13 +346,20 @@ def flash_knn_triton_flashlargek(
     device = x.device
 
     c = c.contiguous()
-    csq = _get_or_compute_csq(c)  # (M,) fp32
-    bucket_origin, bucket_inv_delta = _sample_range_per_row(x, c, csq, k)
+    bucket_origin, bucket_inv_delta = _sample_range_per_row(x, c, k)
 
     cfg = _heuristic_flashlargek_config(N=N, M=M, D=D)
     BN, BM, D_INNER = cfg["BN"], cfg["BM"], cfg["D_INNER"]
     CHUNK = BN
     K_CAP = k  # k slots / bucket
+
+    # The kernel uses int32 addressing: every tensor offset must stay < 2**31.
+    # Largest are the corpus (M·D) and the cand buffer (BN·256·K_CAP). Holds for
+    # M ≲ 2.79M at D=768 and k ≲ 131072 at BN=64.
+    assert M * D < 2**31 and BN * _NUM_BUCKETS * K_CAP < 2**31, (
+        f"int32 offsets would overflow (M*D={M * D}, "
+        f"BN*256*K_CAP={BN * _NUM_BUCKETS * K_CAP}); restore int64 addressing"
+    )
 
     out_idxs = torch.empty((N, k), device=device, dtype=torch.int32)
     out_shift = (
@@ -388,7 +401,6 @@ def flash_knn_triton_flashlargek(
         _flashlargek_fused_kernel[grid](
             xb,
             c,
-            csq,
             ob,
             ib,
             bc,
@@ -399,7 +411,6 @@ def flash_knn_triton_flashlargek(
             xb.stride(1),
             c.stride(0),
             c.stride(1),
-            csq.stride(0),
             ob.stride(0),
             bc.stride(0),
             bc.stride(1),
