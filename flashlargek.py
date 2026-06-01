@@ -749,7 +749,7 @@ def flash_knn_triton_flashlargek_flat(
         # topk over the widest fill instead of the full BUF avoids scanning the
         # mostly-empty 10·k buffer at large k.
         w = max(int(qc.max().item()), k)
-        topv, topp = torch.topk(bv[:, :w], k=k, dim=-1, largest=False, sorted=True)
+        topv, topp = torch.topk(bv[:, :w], k=k, dim=-1, largest=False, sorted=False)
         out_idxs[q0:q1] = torch.gather(bi[:, :w], 1, topp)
         if return_distances:
             out_shift[q0:q1] = topv
