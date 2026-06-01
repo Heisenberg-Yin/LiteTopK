@@ -57,8 +57,16 @@ _NUM_BUCKETS = 256
 _BUCKET_EPS = 1.0e-20
 
 
+def _sample_size_for(M: int, k: int) -> int:
+    # S must be >= k so the sample kth-score upper-bounds the full-corpus kth.
+    return min(M, max(k, 16384))
+
+
 # ────────────────────────── fused pass ─────────────────────────────────
 
+# NOTE: The bucket-partitioned [CHUNK, 256, k] implementation is kept below for
+# reference, but disabled while iterating on the flat-buffer path.
+'''
 
 @triton.jit
 def _flashlargek_fused_kernel(
@@ -213,6 +221,7 @@ def _flashlargek_fused_kernel(
     )
     tl.store(cand_val_ptr + cv_off, score, mask=store_mask)
     tl.store(cand_idx_ptr + ci_off, m_offs[None, :].to(tl.int32), mask=store_mask)
+'''
 
 
 # ────────────────────────── host driver ────────────────────────────────
@@ -248,12 +257,131 @@ def _sample_range_per_row(
     ``min(M, max(k, 16384))`` corpus rows, using ``s = ‖c‖² − 2⟨x,c⟩``. The true
     full-corpus k-th smallest is ≤ the sample's, so it sits inside the range.
     Returns ``(bucket_origin, bucket_inv_delta)`` of shape ``(N,)``."""
+    bucket_origin, bucket_inv_delta, _ = _sample_range_per_row_impl(x, c, k)
+    return bucket_origin, bucket_inv_delta
+
+
+@torch.no_grad()
+def _sample_range_topk_per_row(
+    x: torch.Tensor,
+    c: torch.Tensor,
+    k: int,
+    *,
+    sample_size: int | None = None,
+    sample_val_out: torch.Tensor | None = None,
+    sample_idx_out: torch.Tensor | None = None,
+    sample_count_out: torch.Tensor | None = None,
+    store_topk: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, int, bool]:
+    """Triton sample pass: compute the per-row bucket range.
+
+    If the sample has more than ``k`` rows, materialize sample scores with
+    Triton and use ``torch.topk`` to set the range ceiling to the sample kth
+    score, matching the old torch.matmul path. When ``store_topk`` is true, the
+    selected sample top-k is also copied into the flat candidate buffer so the
+    caller can scan only the tail after ``c[:S]``.
+    """
+    M = c.shape[0]
+    S = _sample_size_for(M, k) if sample_size is None else sample_size
+    assert k <= S <= M
+    R, D = x.shape
+    cfg = _heuristic_flashlargek_config(N=R, M=S, D=D)
+    BN, BM, D_INNER = cfg["BN"], cfg["BM"], cfg["D_INNER"]
+    grid_m = math.ceil(S / BM)
+    grid_n = math.ceil(R / BN)
+
+    grid = (grid_m, grid_n)
+
+    if k < S:
+        sample_score = torch.empty((R, S), device=x.device, dtype=torch.float32)
+        _sample_scores_kernel[grid](
+            x,
+            c,
+            sample_score,
+            x.stride(0),
+            x.stride(1),
+            c.stride(0),
+            c.stride(1),
+            sample_score.stride(0),
+            sample_score.stride(1),
+            N=R,
+            M=S,
+            D=D,
+            BN=BN,
+            BM=BM,
+            D_INNER=D_INNER,
+            num_warps=cfg["num_warps"],
+        )
+        top = torch.topk(
+            sample_score, k=k, dim=-1, largest=False, sorted=False
+        )
+        top_vals = top.values
+        bucket_origin = top_vals.amin(dim=-1).contiguous()
+        sample_hi = top_vals.amax(dim=-1)
+        sample_written = False
+        if store_topk:
+            assert (
+                sample_val_out is not None
+                and sample_idx_out is not None
+                and sample_count_out is not None
+            )
+            sample_val_out[:, :k].copy_(top_vals)
+            sample_idx_out[:, :k].copy_(top.indices.to(torch.int32))
+            sample_count_out.fill_(k)
+            sample_written = True
+    else:
+        sample_min_tmp = torch.empty(
+            (grid_m, grid_n * BN), device=x.device, dtype=torch.float32
+        )
+        sample_max_tmp = torch.empty(
+            (grid_m, grid_n * BN), device=x.device, dtype=torch.float32
+        )
+        _sample_minmax_kernel[grid](
+            x,
+            c,
+            sample_min_tmp,
+            sample_max_tmp,
+            x.stride(0),
+            x.stride(1),
+            c.stride(0),
+            c.stride(1),
+            sample_min_tmp.stride(0),
+            sample_min_tmp.stride(1),
+            sample_max_tmp.stride(0),
+            sample_max_tmp.stride(1),
+            N=R,
+            M=S,
+            D=D,
+            BN=BN,
+            BM=BM,
+            D_INNER=D_INNER,
+            num_warps=cfg["num_warps"],
+        )
+        bucket_origin = sample_min_tmp[:, :R].amin(dim=0).contiguous()
+        sample_hi = sample_max_tmp[:, :R].amax(dim=0)
+        sample_written = False
+
+    span = torch.clamp(sample_hi - bucket_origin, min=_BUCKET_EPS)
+    bucket_inv_delta = ((_NUM_BUCKETS - 1) / span).contiguous()
+
+    return bucket_origin, bucket_inv_delta, S, sample_written
+
+
+@torch.no_grad()
+def _sample_range_per_row_impl(
+    x: torch.Tensor,
+    c: torch.Tensor,
+    k: int,
+    *,
+    sample_size: int | None = None,
+):
     M = c.shape[0]
     # S must be ≥ k: the range max is the sample's k-th smallest, and only with
     # S ≥ k does the subset argument (true k-th ≤ sample k-th) hold, so the range
     # is guaranteed to contain the true top-K. A 16384 floor keeps small-k well
     # sampled. (The old min(16384, ...) capped S and broke exactness for k>16384.)
-    S = min(M, max(k, 16384))
+    S = _sample_size_for(M, k) if sample_size is None else sample_size
+    assert k <= S <= M
     k_eff = min(k, S)  # == k since S ≥ k
 
     cs = c[:S, :].float()
@@ -266,7 +394,8 @@ def _sample_range_per_row(
     if k_eff < S:
         # the k_eff smallest values; their min is the global min and their max
         # is the k_eff-th smallest. sorted=False: order inside the set is unused.
-        vals = torch.topk(s_sample, k=k_eff, dim=-1, largest=False, sorted=False).values
+        top = torch.topk(s_sample, k=k_eff, dim=-1, largest=False, sorted=False)
+        vals = top.values
         min_score = vals.amin(dim=-1)
         max_score = vals.amax(dim=-1)
     else:  # k_eff == S: the whole sample is the top-k → just its min and max
@@ -277,9 +406,162 @@ def _sample_range_per_row(
     # last valid bucket 255, not bucket 256 which in_range would drop. Matters
     # when S == M (small corpus): then max_score == the true k-th, and that
     # boundary item must be kept.
-    return min_score.contiguous(), ((_NUM_BUCKETS - 1) / span).contiguous()
+    bucket_origin = min_score.contiguous()
+    bucket_inv_delta = ((_NUM_BUCKETS - 1) / span).contiguous()
+    return bucket_origin, bucket_inv_delta, S
 
 
+@triton.jit
+def _sample_scores_kernel(
+    x_ptr,
+    c_ptr,
+    score_ptr,
+    stride_x_n,
+    stride_x_d,
+    stride_c_m,
+    stride_c_d,
+    stride_s_n,
+    stride_s_m,
+    N: tl.constexpr,
+    M: tl.constexpr,
+    D: tl.constexpr,
+    BN: tl.constexpr,
+    BM: tl.constexpr,
+    D_INNER: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    n_offs = pid_n * BN + tl.arange(0, BN)
+    n_mask = n_offs < N
+    m_offs = pid_m * BM + tl.arange(0, BM)
+    m_mask = m_offs < M
+
+    if D_INNER >= D:
+        d_offs = tl.arange(0, D_INNER)
+        d_mask = d_offs < D
+        x_tile = tl.load(
+            x_ptr + n_offs[:, None] * stride_x_n + d_offs[None, :] * stride_x_d,
+            mask=n_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        c_tile = tl.load(
+            c_ptr + m_offs[:, None] * stride_c_m + d_offs[None, :] * stride_c_d,
+            mask=m_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        cross = tl.dot(x_tile, tl.trans(c_tile)).to(tl.float32)
+        c_f = c_tile.to(tl.float32)
+        csq = tl.sum(c_f * c_f, axis=1)
+    else:
+        cross = tl.zeros([BN, BM], dtype=tl.float32)
+        csq = tl.zeros([BM], dtype=tl.float32)
+        for d_start in range(0, D, D_INNER):
+            d_offs = d_start + tl.arange(0, D_INNER)
+            d_mask = d_offs < D
+            x_sub = tl.load(
+                x_ptr + n_offs[:, None] * stride_x_n + d_offs[None, :] * stride_x_d,
+                mask=n_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            c_sub = tl.load(
+                c_ptr + m_offs[:, None] * stride_c_m + d_offs[None, :] * stride_c_d,
+                mask=m_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            cross += tl.dot(x_sub, tl.trans(c_sub)).to(tl.float32)
+            c_f = c_sub.to(tl.float32)
+            csq += tl.sum(c_f * c_f, axis=1)
+
+    score = csq[None, :] - 2.0 * cross
+    tl.store(
+        score_ptr + n_offs[:, None] * stride_s_n + m_offs[None, :] * stride_s_m,
+        score,
+        mask=n_mask[:, None] & m_mask[None, :],
+    )
+
+
+@triton.jit
+def _sample_minmax_kernel(
+    x_ptr,
+    c_ptr,
+    min_tmp_ptr,
+    max_tmp_ptr,
+    stride_x_n,
+    stride_x_d,
+    stride_c_m,
+    stride_c_d,
+    stride_min_m,
+    stride_min_n,
+    stride_max_m,
+    stride_max_n,
+    N: tl.constexpr,
+    M: tl.constexpr,
+    D: tl.constexpr,
+    BN: tl.constexpr,
+    BM: tl.constexpr,
+    D_INNER: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    n_offs = pid_n * BN + tl.arange(0, BN)
+    n_mask = n_offs < N
+    m_offs = pid_m * BM + tl.arange(0, BM)
+    m_mask = m_offs < M
+
+    if D_INNER >= D:
+        d_offs = tl.arange(0, D_INNER)
+        d_mask = d_offs < D
+        x_tile = tl.load(
+            x_ptr + n_offs[:, None] * stride_x_n + d_offs[None, :] * stride_x_d,
+            mask=n_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        c_tile = tl.load(
+            c_ptr + m_offs[:, None] * stride_c_m + d_offs[None, :] * stride_c_d,
+            mask=m_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        cross = tl.dot(x_tile, tl.trans(c_tile)).to(tl.float32)
+        c_f = c_tile.to(tl.float32)
+        csq = tl.sum(c_f * c_f, axis=1)
+    else:
+        cross = tl.zeros([BN, BM], dtype=tl.float32)
+        csq = tl.zeros([BM], dtype=tl.float32)
+        for d_start in range(0, D, D_INNER):
+            d_offs = d_start + tl.arange(0, D_INNER)
+            d_mask = d_offs < D
+            x_sub = tl.load(
+                x_ptr + n_offs[:, None] * stride_x_n + d_offs[None, :] * stride_x_d,
+                mask=n_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            c_sub = tl.load(
+                c_ptr + m_offs[:, None] * stride_c_m + d_offs[None, :] * stride_c_d,
+                mask=m_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            cross += tl.dot(x_sub, tl.trans(c_sub)).to(tl.float32)
+            c_f = c_sub.to(tl.float32)
+            csq += tl.sum(c_f * c_f, axis=1)
+
+    score = csq[None, :] - 2.0 * cross
+    valid = n_mask[:, None] & m_mask[None, :]
+    row_min = tl.min(tl.where(valid, score, float("inf")), axis=1)
+    row_max = tl.max(tl.where(valid, score, -float("inf")), axis=1)
+    tl.store(
+        min_tmp_ptr + pid_m * stride_min_m + n_offs * stride_min_n,
+        row_min,
+        mask=n_mask,
+    )
+    tl.store(
+        max_tmp_ptr + pid_m * stride_max_m + n_offs * stride_max_n,
+        row_max,
+        mask=n_mask,
+    )
+
+# NOTE: The bucket-buffer gather and public bucket entry point are kept for
+# reference, but disabled with the bucket-partitioned Triton kernel above.
+'''
 def _gather_topk_chunk(
     bcount: torch.Tensor,
     cand_val: torch.Tensor,
@@ -554,6 +836,7 @@ def flash_knn_triton_flashlargek(
     x_sq = (x.float() * x.float()).sum(dim=-1)  # (N,)
     out_vals = (out_shift + x_sq.unsqueeze(-1)).clamp_min_(0.0)
     return out_vals.float(), out_idxs
+'''
 
 
 # ══════════════════ experimental: flat per-query append buffer ══════════════
@@ -600,12 +883,13 @@ def _flashlargek_flat_kernel(
     NUM_BUCKETS: tl.constexpr,
     NUM_STAGES_PIPE: tl.constexpr = 2,
     CNT_EVERY: tl.constexpr = 1,
+    M_START: tl.constexpr = 0,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     n_offs = pid_n * BN + tl.arange(0, BN)
     n_mask = n_offs < N
-    m_offs = pid_m * BM + tl.arange(0, BM)
+    m_offs = M_START + pid_m * BM + tl.arange(0, BM)
     m_mask = m_offs < M
 
     # score = ‖c‖² − 2⟨x,c⟩ with ‖c‖² fused from the same c tiles (single pass)
@@ -694,9 +978,13 @@ def flash_knn_triton_flashlargek_flat(
     buf_mult: int = 10,
     return_distances: bool = True,
 ):
-    """Experimental flat-buffer variant: per-query append buffer [CHUNK, buf_mult*k]
-    + a single torch.topk, instead of the [CHUNK, 256, k] bucket buffer + gap-free
-    gather. Exact only when count_at_T ≲ buf_mult*k. Speed experiment."""
+    """Experimental flat-buffer variant.
+
+    When the sample has more than ``k`` rows, its top-k scores are copied into
+    the flat buffer and the main flat kernel scans only the tail after
+    ``c[:S]``. Exact only when count_at_T ≲ BUF (else the flat buffer can
+    overflow and drop candidates). Speed experiment vs the gap-free gather.
+    """
     assert x.is_cuda and c.is_cuda and x.ndim == 2 and c.ndim == 2
     N, D = x.shape
     M, Dc = c.shape
@@ -710,45 +998,59 @@ def flash_knn_triton_flashlargek_flat(
     assert M * D < 2**31 and BN * BUF < 2**31
 
     c = c.contiguous()
-    bucket_origin, bucket_inv_delta = _sample_range_per_row(x, c, k)
+    # The cheap prefix-size decision is needed before scratch allocation and
+    # launch-grid setup. The expensive sample pass happens per query chunk below.
+    sample_size = _sample_size_for(M, k)
     cnt_every = int(os.environ.get("FLASHLARGEK_CNT_EVERY", str(max(1, k // 2))))
 
     out_idxs = torch.empty((N, k), device=device, dtype=torch.int32)
     out_shift = torch.empty((N, k), device=device, dtype=torch.float32) if return_distances else None
 
+    buf_val = torch.empty((CHUNK, BUF), device=device, dtype=torch.float32)
+    buf_idx = torch.empty((CHUNK, BUF), device=device, dtype=torch.int32)
+    qcount = torch.empty((CHUNK,), device=device, dtype=torch.int32)
     bcount = torch.empty((CHUNK, _NUM_BUCKETS), device=device, dtype=torch.int32)
     threshold = torch.empty((CHUNK,), device=device, dtype=torch.int32)
     wcount = torch.zeros((1,), device=device, dtype=torch.int32)
-    qcount = torch.empty((CHUNK,), device=device, dtype=torch.int32)
-    buf_val = torch.empty((CHUNK, BUF), device=device, dtype=torch.float32)
-    buf_idx = torch.empty((CHUNK, BUF), device=device, dtype=torch.int32)
 
-    grid_m = math.ceil(M / BM)
     for q0 in range(0, N, CHUNK):
         q1 = min(q0 + CHUNK, N)
         R = q1 - q0
         xb = x[q0:q1].contiguous()
-        ob = bucket_origin[q0:q1]
-        ib = bucket_inv_delta[q0:q1]
-        bc = bcount[:R]; th = threshold[:R]; qc = qcount[:R]
-        bv = buf_val[:R]; bi = buf_idx[:R]
-        bc.zero_(); th.fill_(_NUM_BUCKETS - 1); qc.zero_(); wcount.zero_()
+        bv = buf_val[:R]
+        bi = buf_idx[:R]
+        qc = qcount[:R]
         bv.fill_(float("inf"))
-
-        _flashlargek_flat_kernel[(grid_m, math.ceil(R / BN))](
-            xb, c, ob, ib, bc, th, wcount, qc, bv, bi,
-            xb.stride(0), xb.stride(1), c.stride(0), c.stride(1), ob.stride(0),
-            bc.stride(0), bc.stride(1), th.stride(0), qc.stride(0),
-            bv.stride(0), bv.stride(1), bi.stride(0), bi.stride(1),
-            N=R, M=M, D=D, K=k, BUF=BUF, BN=BN, BM=BM, D_INNER=D_INNER,
-            NUM_BUCKETS=_NUM_BUCKETS, NUM_STAGES_PIPE=cfg["num_stages_pipe"],
-            CNT_EVERY=cnt_every, num_warps=cfg["num_warps"],
+        qc.zero_()
+        ob, ib, _, sample_written = _sample_range_topk_per_row(
+            xb,
+            c,
+            k,
+            sample_size=sample_size,
+            sample_val_out=bv,
+            sample_idx_out=bi,
+            sample_count_out=qc,
+            store_topk=True,
         )
 
-        # only the first qcount[q] slots of each query are real (rest are inf);
-        # topk over the widest fill instead of the full BUF avoids scanning the
-        # mostly-empty 10·k buffer at large k.
-        w = max(int(qc.max().item()), k)
+        scan_start = sample_size if sample_written else 0
+        grid_m = math.ceil((M - scan_start) / BM)
+        if grid_m > 0:
+            bc = bcount[:R]; th = threshold[:R]
+            bc.zero_(); th.fill_(_NUM_BUCKETS - 1); wcount.zero_()
+
+            _flashlargek_flat_kernel[(grid_m, math.ceil(R / BN))](
+                xb, c, ob, ib, bc, th, wcount, qc, bv, bi,
+                xb.stride(0), xb.stride(1), c.stride(0), c.stride(1), ob.stride(0),
+                bc.stride(0), bc.stride(1), th.stride(0), qc.stride(0),
+                bv.stride(0), bv.stride(1), bi.stride(0), bi.stride(1),
+                N=R, M=M, D=D, K=k, BUF=BUF, BN=BN, BM=BM, D_INNER=D_INNER,
+                NUM_BUCKETS=_NUM_BUCKETS, NUM_STAGES_PIPE=cfg["num_stages_pipe"],
+                CNT_EVERY=cnt_every, M_START=scan_start, num_warps=cfg["num_warps"],
+            )
+
+        # Topk over the widest written prefix avoids empty slots.
+        w = min(max(int(qc.max().item()), k), BUF)
         topv, topp = torch.topk(bv[:, :w], k=k, dim=-1, largest=False, sorted=False)
         out_idxs[q0:q1] = torch.gather(bi[:, :w], 1, topp)
         if return_distances:

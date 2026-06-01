@@ -1,7 +1,7 @@
 """Standalone benchmark for efficientlargek (a self-contained copy of flashlib-2's
 large-K fused KNN kernel).
 
-Loads the real ``base.fvecs`` corpus, runs ``flash_knn_triton_flashlargek`` on it,
+Loads the real ``base.fvecs`` corpus, runs ``flash_knn_triton_flashlargek_flat`` on it,
 reports timing + peak memory, and checks recall@k against an exact brute-force
 top-k on a subset of queries (so the test needs nothing but this folder + the
 data file).
@@ -25,7 +25,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 import torch
 
-from flashlargek import flash_knn_triton_flashlargek
+# Bucket-buffer entry point is currently commented out in flashlargek.py.
+# from flashlargek import flash_knn_triton_flashlargek
+from flashlargek import flash_knn_triton_flashlargek_flat
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_BASE = os.path.join(os.path.dirname(_HERE), "base.fvecs")
@@ -107,7 +109,8 @@ def main():
     c = X                                                     # (M, D)
     print(f"M={M} N={N} D={D} k={k}  X={X.element_size()*X.numel()/1e9:.2f} GB")
 
-    fn = lambda: flash_knn_triton_flashlargek(x, c, k, return_distances=True)
+    # fn = lambda: flash_knn_triton_flashlargek(x, c, k, return_distances=True)
+    fn = lambda: flash_knn_triton_flashlargek_flat(x, c, k, return_distances=True)
 
     print("warming up (triton compile/autotune) ...")
     for _ in range(args.warmup):
@@ -115,7 +118,7 @@ def main():
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
 
-    (vals, idxs), times = _time_cuda(fn, warmup=0, iters=args.iters, label="efficientlargek")
+    (vals, idxs), times = _time_cuda(fn, warmup=0, iters=args.iters, label="efficientlargek-flat")
     print(f"peak GPU mem = {torch.cuda.max_memory_allocated()/1e9:.2f} GB")
 
     if args.recall_queries > 0:

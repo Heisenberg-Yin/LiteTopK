@@ -1,3 +1,10 @@
+"""Disabled benchmark entry point.
+
+Use ``benchmark.py`` as the single active benchmark script. The previous
+baseline implementation is commented below for reference.
+"""
+
+'''
 """Baseline 4 — faiss-GPU ``knn_gpu`` (brute-force exact top-K).
 
 faiss-GPU has no public API to top-k a *precomputed* score matrix (unlike
@@ -74,3 +81,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+'''

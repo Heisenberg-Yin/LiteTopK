@@ -1,3 +1,10 @@
+"""Disabled benchmark entry point.
+
+Use ``benchmark.py`` as the single active benchmark script. The previous
+baseline implementation is commented below for reference.
+"""
+
+'''
 """Baseline 2 — ``torch.matmul`` + RAFT ``select_k`` large-K KNN.
 
 Same scoring as the torch baseline (``s = ‖c‖² − 2⟨x,c⟩`` via one matmul), but
@@ -85,3 +92,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+'''

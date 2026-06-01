@@ -1,3 +1,10 @@
+"""Disabled benchmark entry point.
+
+Use ``benchmark.py`` as the single active benchmark script. The previous
+baseline implementation is commented below for reference.
+"""
+
+'''
 """Baseline 3 — original flashlib ``flash_knn`` (fused brute-force exact top-K).
 
 Pristine upstream flashlib (github.com/FlashML-org/flashlib), used as an
@@ -60,3 +67,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+'''

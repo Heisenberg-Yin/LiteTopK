@@ -1,3 +1,10 @@
+"""Disabled benchmark entry point.
+
+Use ``benchmark.py`` as the single active benchmark script. The previous
+baseline implementation is commented below for reference.
+"""
+
+'''
 """Baseline 1 — ``torch.matmul`` + ``torch.topk`` large-K KNN.
 
 For a batch of ``--batch-size`` queries against the corpus, computes the
@@ -79,3 +86,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+'''
