@@ -244,7 +244,8 @@ def _heuristic_flashlargek_config(*, N: int, M: int, D: int) -> dict:
         BN = 64  # N = 64, 256, 1024, ... all chunk into 64-query tiles
     BM = 64 if D >= 256 else 128
     D_INNER = _next_pow2(D) if D <= 64 else 64
-    return dict(BN=BN, BM=BM, D_INNER=D_INNER, num_warps=8, num_stages_pipe=2)
+    num_warps = int(os.environ.get("FLASHLARGEK_NUM_WARPS", "8"))
+    return dict(BN=BN, BM=BM, D_INNER=D_INNER, num_warps=num_warps, num_stages_pipe=2)
 
 
 @torch.no_grad()
@@ -275,11 +276,12 @@ def _sample_range_topk_per_row(
 ) -> Tuple[torch.Tensor, torch.Tensor, int, bool]:
     """Triton sample pass: compute the per-row bucket range.
 
-    If the sample has more than ``k`` rows, materialize sample scores with
-    Triton and use ``torch.topk`` to set the range ceiling to the sample kth
-    score, matching the old torch.matmul path. When ``store_topk`` is true, the
-    selected sample top-k is also copied into the flat candidate buffer so the
-    caller can scan only the tail after ``c[:S]``.
+    Materialize sample scores with Triton. If the sample has more than ``k``
+    rows, use ``torch.topk`` to set the range ceiling to the sample kth score,
+    matching the old torch.matmul path. If ``S == k``, the whole sample is the
+    top-k sample set. When ``store_topk`` is true, the selected sample candidates
+    are copied into the flat buffer so the caller can scan only the tail after
+    ``c[:S]``.
     """
     M = c.shape[0]
     S = _sample_size_for(M, k) if sample_size is None else sample_size
@@ -292,74 +294,47 @@ def _sample_range_topk_per_row(
 
     grid = (grid_m, grid_n)
 
+    sample_score = torch.empty((R, S), device=x.device, dtype=torch.float32)
+    _sample_scores_kernel[grid](
+        x,
+        c,
+        sample_score,
+        x.stride(0),
+        x.stride(1),
+        c.stride(0),
+        c.stride(1),
+        sample_score.stride(0),
+        sample_score.stride(1),
+        N=R,
+        M=S,
+        D=D,
+        BN=BN,
+        BM=BM,
+        D_INNER=D_INNER,
+        num_warps=cfg["num_warps"],
+    )
     if k < S:
-        sample_score = torch.empty((R, S), device=x.device, dtype=torch.float32)
-        _sample_scores_kernel[grid](
-            x,
-            c,
-            sample_score,
-            x.stride(0),
-            x.stride(1),
-            c.stride(0),
-            c.stride(1),
-            sample_score.stride(0),
-            sample_score.stride(1),
-            N=R,
-            M=S,
-            D=D,
-            BN=BN,
-            BM=BM,
-            D_INNER=D_INNER,
-            num_warps=cfg["num_warps"],
-        )
-        top = torch.topk(
-            sample_score, k=k, dim=-1, largest=False, sorted=False
-        )
+        top = torch.topk(sample_score, k=k, dim=-1, largest=False, sorted=False)
         top_vals = top.values
-        bucket_origin = top_vals.amin(dim=-1).contiguous()
-        sample_hi = top_vals.amax(dim=-1)
-        sample_written = False
-        if store_topk:
-            assert (
-                sample_val_out is not None
-                and sample_idx_out is not None
-                and sample_count_out is not None
-            )
-            sample_val_out[:, :k].copy_(top_vals)
-            sample_idx_out[:, :k].copy_(top.indices.to(torch.int32))
-            sample_count_out.fill_(k)
-            sample_written = True
+        top_idxs = top.indices.to(torch.int32)
     else:
-        sample_min_tmp = torch.empty(
-            (grid_m, grid_n * BN), device=x.device, dtype=torch.float32
+        top_vals = sample_score
+        top_idxs = torch.arange(S, device=x.device, dtype=torch.int32)[
+            None, :
+        ].expand(R, S)
+    bucket_origin = top_vals.amin(dim=-1).contiguous()
+    sample_hi = top_vals.amax(dim=-1)
+    sample_written = False
+    if store_topk:
+        assert (
+            sample_val_out is not None
+            and sample_idx_out is not None
+            and sample_count_out is not None
         )
-        sample_max_tmp = torch.empty(
-            (grid_m, grid_n * BN), device=x.device, dtype=torch.float32
-        )
-        _sample_minmax_kernel[grid](
-            x,
-            c,
-            sample_min_tmp,
-            sample_max_tmp,
-            x.stride(0),
-            x.stride(1),
-            c.stride(0),
-            c.stride(1),
-            sample_min_tmp.stride(0),
-            sample_min_tmp.stride(1),
-            sample_max_tmp.stride(0),
-            sample_max_tmp.stride(1),
-            N=R,
-            M=S,
-            D=D,
-            BN=BN,
-            BM=BM,
-            D_INNER=D_INNER,
-            num_warps=cfg["num_warps"],
-        )
-        bucket_origin = sample_min_tmp[:, :R].amin(dim=0).contiguous()
-        sample_hi = sample_max_tmp[:, :R].amax(dim=0)
-        sample_written = False
+        sample_val_out[:, :k].copy_(top_vals)
+        sample_idx_out[:, :k].copy_(top_idxs)
+        sample_count_out.fill_(k)
+        sample_written = True
 
     span = torch.clamp(sample_hi - bucket_origin, min=_BUCKET_EPS)
     bucket_inv_delta = ((_NUM_BUCKETS - 1) / span).contiguous()
