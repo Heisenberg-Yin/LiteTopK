@@ -1,0 +1,19 @@
+--- /home/user/vllm-v0.23.0/vllm/v1/attention/backends/mla/indexer.py	2026-07-08 15:55:22.043300910 +0000
++++ /opt/simtopk_repro/vllm/vllm/v1/attention/backends/mla/indexer.py	2026-07-13 00:22:26.889592847 +0000
+@@ -518,7 +518,15 @@
+             prefill_query_lens_cpu = torch.diff(
+                 query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
+             )
+-            max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
++            import os as _os
++            # litetopk: decouple declared budget (init-time pool carve) from
++            # runtime use -- lets a hybrid deployment reserve free headroom
++            # for its own transients while the official path stays small.
++            _rt = int(_os.environ.get("VLLM_LITETOPK_RUNTIME_LOGITS_MB", "0"))
++            _mb = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB
++            if _rt > 0:
++                _mb = min(_mb, _rt)
++            max_logits_bytes = _mb * 1024 * 1024
+             # Upper bound is exact for prefill rows (the `[num_decodes:]`
+             # slice below).
+             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None

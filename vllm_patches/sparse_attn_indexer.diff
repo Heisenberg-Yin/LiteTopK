@@ -1,0 +1,279 @@
+--- /home/user/vllm-v0.23.0/vllm/model_executor/layers/sparse_attn_indexer.py	2026-07-08 15:55:21.971300910 +0000
++++ /opt/simtopk_repro/vllm/vllm/model_executor/layers/sparse_attn_indexer.py	2026-07-13 00:25:04.221591769 +0000
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Custom Sparse Attention Indexer layers."""
+ 
++import os
++
+ import torch
+ 
+ import vllm.envs as envs
+@@ -31,6 +33,76 @@
+ 
+ logger = init_logger(__name__)
+ 
++# ---- LiteTopK fused sparse indexer hook (VLLM_LITETOPK=1) ---------------------
++_LITETOPK_MOD = None
++_LITETOPK_OFF = os.environ.get("VLLM_LITETOPK", "0") != "1"
++
++
++def _litetopk_try(q, k, k_scale, w, ks, ke, out_idx, topk,
++                 num_reqs=None, ke_min_hint=None) -> bool:
++    global _LITETOPK_MOD, _LITETOPK_OFF
++    if _LITETOPK_OFF:
++        return False
++    if _LITETOPK_MOD is None:
++        try:
++            import sys as _sys
++            _p = "/opt/simtopk_repro/glm5_prefill/litetopk_vllm"
++            if _p not in _sys.path:
++                _sys.path.insert(0, _p)
++            import litetopk_indexer as _LITETOPK_MOD_  # noqa: N813
++            _LITETOPK_MOD = _LITETOPK_MOD_
++            logger.info("LiteTopK indexer hook enabled (min_s=%d, sample=%d)",
++                        _LITETOPK_MOD.MIN_S, _LITETOPK_MOD.SAMPLE)
++        except Exception as e:  # noqa: BLE001
++            logger.warning("LiteTopK hook import failed, disabled: %s", e)
++            _LITETOPK_OFF = True
++            return False
++    return _LITETOPK_MOD.try_chunk(q, k, k_scale, w, ks, ke, out_idx, topk,
++                                  num_reqs=num_reqs, ke_min_hint=ke_min_hint)
++
++
++def _litetopk_merge_wanted(total_seq_lens: int) -> bool:
++    """True when the module is loaded, merge mode is on and S >= MIN_S."""
++    global _LITETOPK_MOD, _LITETOPK_OFF
++    if _LITETOPK_OFF:
++        return False
++    if _LITETOPK_MOD is None:
++        try:
++            import sys as _sys
++            _p = "/opt/simtopk_repro/glm5_prefill/litetopk_vllm"
++            if _p not in _sys.path:
++                _sys.path.insert(0, _p)
++            import litetopk_indexer as _LITETOPK_MOD_  # noqa: N813
++            _LITETOPK_MOD = _LITETOPK_MOD_
++        except Exception as e:  # noqa: BLE001
++            logger.warning("LiteTopK hook import failed, disabled: %s", e)
++            _LITETOPK_OFF = True
++            return False
++    return bool(getattr(_LITETOPK_MOD, "MERGE", False)
++                and total_seq_lens >= _LITETOPK_MOD.MIN_S)
++
++
++_LITETOPK_SIDE = None
++
++
++def _litetopk_try_merged(q, k, k_scale, w, out_idx, topk, S, Qtot,
++                        probe_k=None, probe_scale=None, gather_event=None,
++                        strided_plan=None, pre_compacted=False,
++                        hot_key=None) -> bool:
++    if _LITETOPK_OFF or _LITETOPK_MOD is None:
++        return False
++    try:
++        return _LITETOPK_MOD.try_merged(q, k, k_scale, w, out_idx, topk, S, Qtot,
++                                       probe_k=probe_k, probe_scale=probe_scale,
++                                       gather_event=gather_event,
++                                       strided_plan=strided_plan,
++                                       pre_compacted=pre_compacted,
++                                       hot_key=hot_key)
++    except Exception as e:  # noqa: BLE001
++        print(f"[litetopk] merged fallback due to: {e}", flush=True)
++        return False
++
++
+ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+ 
+ # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
+@@ -189,7 +261,136 @@
+             values_spec,
+             scales_spec,
+         )
+-        for chunk in prefill_metadata.chunks:
++        merged_done = False
++        _chunks = prefill_metadata.chunks
++        if (
++            not use_fp4_cache
++            and q_scale is None
++            and len(_chunks) > 1
++            and all(c.num_reqs == 1 for c in _chunks)
++            and _litetopk_merge_wanted(_chunks[-1].total_seq_lens)
++        ):
++            # LiteTopK merged mode with gather/sample overlap: probe pages are
++            # gathered straight from the PAGED cache on the main stream (the
++            # threshold probe only needs 256 spread pages), the full workspace
++            # gather runs CONCURRENTLY on a side stream, and the scan waits on
++            # its event inside the module. Official's monolithic dense GEMM
++            # cannot start before the full gather; our sample can.
++            global _LITETOPK_SIDE
++            _S = _chunks[-1].total_seq_lens
++            _t0, _t1 = _chunks[0].token_start, _chunks[-1].token_end
++            _Qtot = _t1 - _t0
++            _pk = _psc = _gev = None
++            _dev = q_quant.device
++            _ke_min = _S - _Qtot + 1
++            # mode + probe size from the module policy (certificate-strided
++            # for S>=400K with a 64K probe; prefix below), decided BEFORE
++            # gathering: strided -> gather the workspace COMPACTED (probe
++            # pages skipped at gather time = zero re-copy)
++            try:
++                _strided, _ps = _LITETOPK_MOD.plan_sampling(_Qtot, _ke_min)
++            except Exception:  # noqa: BLE001
++                _strided, _ps = False, int(getattr(_LITETOPK_MOD, "SSAMPLE", 16384))
++            _npage = _ps // 64
++            _span_pg = (_ke_min - topk_tokens) // 64
++            _pstp = max(_span_pg // _npage, 1) if _span_pg > 2 * _npage else 0
++            _strided = _strided and _pstp >= 2
++            # HOTONLY: hot indices are original coordinates -> workspace must
++            # be gathered FULL (no probe-page compaction) and no external
++            # probe is needed (module-side PAGE_PROBE covers cold start).
++            _hot = (bool(getattr(_LITETOPK_MOD, "HOTONLY", False))
++                    and int(getattr(_LITETOPK_MOD, "HOTSAMPLE", 0)) > 0)
++            _compacted = False
++            if _LITETOPK_SIDE is None:
++                _LITETOPK_SIDE = torch.cuda.Stream()
++            # big gather kicked FIRST (nothing consumes it until the scan)
++            _LITETOPK_SIDE.wait_stream(torch.cuda.current_stream())
++            with torch.cuda.stream(_LITETOPK_SIDE):
++                if _strided and not _hot:
++                    try:
++                        _nblk = (_S + 63) // 64
++                        _probe_pg = torch.arange(_npage, device=_dev,
++                                                 dtype=torch.long) * _pstp
++                        _keep = torch.ones(_nblk, dtype=torch.bool, device=_dev)
++                        _keep[_probe_pg] = False
++                        _kbt = _chunks[-1].block_table[0, :_nblk][_keep].view(1, -1)
++                        _Sk0 = _S - _npage * 64
++                        _cu = torch.tensor([0, _Sk0], dtype=torch.int32,
++                                           device=_dev)
++                        ops.cp_gather_indexer_k_quant_cache(
++                            kv_cache, k_quant_full[:_Sk0], k_scale_full[:_Sk0],
++                            _kbt, _cu)
++                        _compacted = True
++                    except Exception:  # noqa: BLE001
++                        _compacted = False
++                if not _compacted:
++                    for chunk in _chunks:
++                        if not chunk.skip_kv_gather:
++                            ops.cp_gather_indexer_k_quant_cache(
++                                kv_cache,
++                                k_quant_full[: chunk.total_seq_lens],
++                                k_scale_full[: chunk.total_seq_lens],
++                                chunk.block_table,
++                                chunk.cu_seq_lens,
++                            )
++                _gev = torch.cuda.Event()
++                _gev.record()
++            # probe pages on the MAIN stream, concurrent with the big gather
++            if _strided and not _hot:
++                try:
++                    _pids = (torch.arange(_npage, device=_dev, dtype=torch.long)
++                             * _pstp).view(1, -1)
++                    _pbt = _chunks[-1].block_table[:1].long().gather(1, _pids) \
++                        .to(_chunks[-1].block_table.dtype)
++                    _pk = torch.empty(_ps, k_quant_full.shape[-1],
++                                      dtype=k_quant_full.dtype, device=_dev)
++                    _psc_raw = torch.empty(_ps, k_scale_full.shape[-1],
++                                           dtype=k_scale_full.dtype, device=_dev)
++                    _pcu = torch.tensor([0, _ps], dtype=torch.int32, device=_dev)
++                    ops.cp_gather_indexer_k_quant_cache(
++                        kv_cache, _pk, _psc_raw, _pbt, _pcu)
++                    _psc = _psc_raw.view(torch.float32).squeeze(-1)
++                except Exception:  # noqa: BLE001
++                    _pk = _psc = None
++            if _compacted and _pk is None:
++                # compacted workspace requires the external probe (its pages
++                # are absent from the workspace); without it, regather full
++                _LITETOPK_SIDE.wait_stream(torch.cuda.current_stream())
++                with torch.cuda.stream(_LITETOPK_SIDE):
++                    for chunk in _chunks:
++                        if not chunk.skip_kv_gather:
++                            ops.cp_gather_indexer_k_quant_cache(
++                                kv_cache,
++                                k_quant_full[: chunk.total_seq_lens],
++                                k_scale_full[: chunk.total_seq_lens],
++                                chunk.block_table,
++                                chunk.cu_seq_lens,
++                            )
++                    _gev = torch.cuda.Event()
++                    _gev.record()
++                _compacted = False
++            _Sk = _S - _npage * 64 if _compacted else _S
++            merged_done = _litetopk_try_merged(
++                q_quant[_t0:_t1],
++                k_quant_full[:_Sk],
++                k_scale_full[:_Sk].view(torch.float32).squeeze(-1),
++                weights[_t0:_t1],
++                topk_indices_buffer[_t0:_t1, :topk_tokens],
++                topk_tokens,
++                _S,
++                _Qtot,
++                probe_k=_pk,
++                probe_scale=_psc,
++                gather_event=_gev,
++                strided_plan=_strided,
++                pre_compacted=_compacted,
++                hot_key=str(k_cache_prefix),
++            )
++            if not merged_done and _gev is not None:
++                # fallback path re-gathers on the main stream; order it after
++                # the side-stream writes to the same workspace
++                torch.cuda.current_stream().wait_event(_gev)
++        for chunk in ([] if merged_done else prefill_metadata.chunks):
+             k_quant = k_quant_full[: chunk.total_seq_lens]
+             k_scale = k_scale_full[: chunk.total_seq_lens]
+ 
+@@ -218,6 +419,33 @@
+                 q_slice_cast = q_slice
+                 k_quant_cast = k_quant
+                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
++            # ---- LiteTopK fused sparse top-k (VLLM_LITETOPK=1) --------------
++            # Skips materializing the full [Q, S] logits for long contexts;
++            # falls through to the official path on any unmet assumption.
++            if (
++                not use_fp4_cache
++                and q_scale_slice is None
++                and _litetopk_try(
++                    q_slice_cast,
++                    k_quant_cast,
++                    k_scale_cast,
++                    weights[chunk.token_start : chunk.token_end],
++                    chunk.cu_seqlen_ks,
++                    chunk.cu_seqlen_ke,
++                    topk_indices_buffer[
++                        chunk.token_start : chunk.token_end, :topk_tokens
++                    ],
++                    topk_tokens,
++                    # CPU-side hints (avoid .item() device syncs in the hook):
++                    # single-request causal chunk => ks all 0 and
++                    # ke_min = total_seq_lens - chunk_query_len + 1.
++                    num_reqs=chunk.num_reqs,
++                    ke_min_hint=chunk.total_seq_lens
++                    - (chunk.token_end - chunk.token_start)
++                    + 1,
++                )
++            ):
++                continue
+             if current_platform.is_xpu():
+                 if q_scale_slice is not None:
+                     raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
+@@ -254,6 +482,18 @@
+                 logits.stride(1),
+                 topk_tokens,
+             )
++            # LiteTopK: on the LAST official chunk before the merged band,
++            # seed the layer's hot carry from this topk (the boundary
++            # merged call then runs hot -- no cold start).
++            if (_LITETOPK_MOD is not None and not _LITETOPK_OFF
++                    and getattr(_LITETOPK_MOD, "HOTONLY", False)):
++                _S_here = chunk.total_seq_lens
++                if _LITETOPK_MOD.MIN_S - 32768 <= _S_here < _LITETOPK_MOD.MIN_S:
++                    try:
++                        _LITETOPK_MOD.stash_carry(
++                            str(k_cache_prefix), topk_indices, _S_here)
++                    except Exception:  # noqa: BLE001
++                        pass
+ 
+     if has_decode:
+         decode_metadata = attn_metadata_narrowed.decode
