@@ -135,13 +135,6 @@ kernels/b200/marsco/bench_flashlib_ip.py     # flashlib baseline
 Each cell = LiteTopK ms / speedup vs cuBLAS dense+top‑k. Recall
 0.9958–0.9990 on every cell (red line ≥0.9958) — all PASS.
 
-| M | k=128 | k=1024 | k=4096 | k=8192 |
-|---:|---|---|---|---|
-| 1M | 0.524 / 1.63× | 0.620 / 1.39× | 0.792 / 1.09× | 0.912 / 1.06× |
-| 2M | 0.697 / 2.31× | 0.843 / 1.93× | 1.133 / 1.44× | 1.327 / 1.30× |
-| 4M | 1.132 / 2.93× | 1.301 / 2.56× | 1.684 / 1.99× | 2.009 / 1.71× |
-| 5M | 1.349 / 3.13× | 1.519 / 2.80× | 1.931 / 2.21× | 2.301 / 1.89× |
-
 The speedup pattern — grows with M, shrinks with k — is the headline. The op
 label prints `LiteTopK SM100 fused`.
 
