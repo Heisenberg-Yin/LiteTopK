@@ -1,7 +1,7 @@
-# LiteTopK — Reproduction Package (code only)
+# LiteTopK — Reproduction Package 
 
 B200 (SM100) LiteTopK sparse top-k: the GLM-5.2 DSA prefill indexer and the MS
-MARCO inner-product retrieval kernel. Code only — no data / weights / logs.
+MARCO inner-product retrieval kernel. 
 
 **Each subfolder has its own README with how to build, run, and reproduce its
 results. This top-level file only says what each subfolder is.**
@@ -17,10 +17,3 @@ results. This top-level file only says what each subfolder is.**
 | `vllm_patches/` | Unified diffs of those two files vs official v0.23.0 — for patching an installed wheel instead of using the vendored tree. |
 | `deepgemm_patch/` | 1-file patch to deep_gemm (SGLang #19529 fix) enabling GLM-5's 32-head shape. |
 
-## Environments (2 docker containers on the 8×B200 host)
-
-- **`simtopk`** — standalone kernel benches (`kernels/`).
-- **`vllm-prefill`** / **`glm5-prefill`** — vLLM E2E (`glm5_prefill/`).
-
-Exact build/run commands, env vars, and result tables live in each subfolder's
-README.
