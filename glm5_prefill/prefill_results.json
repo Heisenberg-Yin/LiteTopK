@@ -1,0 +1,8 @@
+{
+  "model": "/data01/home/ziqi.yin/glm5-fp8-official",
+  "tp": 8,
+  "chunk": 8192,
+  "results": {
+    "1048512": 153.64676809310913
+  }
+}

@@ -9,7 +9,7 @@
 #  uses more transient memory and no MTP; hot-start is the deployed default.)
 # NOTE: prefix caching must stay disabled (run_prefill.py does this).
 LOG=${LOG:-e2e_best.log}
-docker exec -w /opt/simtopk_repro/glm5_prefill vllm-prefill bash -c '
+docker exec -w /opt/litetopk_repro/glm5_prefill vllm-prefill bash -c '
 export PATH=/opt/vllm-venv/bin:$PATH
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 TP=8 \
 MODEL=/models/glm5-fp8-official \

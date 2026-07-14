@@ -18,7 +18,7 @@ Verified by full-tree diff of the deployed container venv
     (`_litetopk_try` / `_litetopk_merge_wanted`); everything else falls
     through to the official path unchanged.
   - **Hardcoded module path**: the hook inserts
-    `/opt/simtopk_repro/glm5_prefill/litetopk_vllm` into `sys.path`.
+    `/opt/litetopk_repro/glm5_prefill/litetopk_vllm` into `sys.path`.
     When reproducing elsewhere, point it at `../glm5_prefill/litetopk_vllm`.
 - `vllm/v1/attention/backends/mla/indexer.py` (`mla_indexer.diff`, 8 added lines)
   - New env `VLLM_LITETOPK_RUNTIME_LOGITS_MB`: decouples the init-time logits

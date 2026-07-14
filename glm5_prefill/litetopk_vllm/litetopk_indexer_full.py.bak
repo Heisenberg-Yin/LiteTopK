@@ -21,7 +21,7 @@ import os
 
 import torch
 
-_DSA_DIR = "/opt/simtopk_repro/kernels/b200/dsa"
+_DSA_DIR = "/opt/litetopk_repro/kernels/b200/dsa"
 _BUILD_DIR = os.environ.get("VLLM_LITETOPK_BUILD", "/root/.cache/litetopk_build")
 
 ENABLED = os.environ.get("VLLM_LITETOPK", "0") == "1"
@@ -235,7 +235,7 @@ def _ext():
             from torch.utils.cpp_extension import load
             dg25 = "/opt/glm5_prefill_test/DeepGEMM"
             if KERNEL == "v3":
-                name, src, bdir = ("litetopk_dsa_b200_v3", "dsa_marsco_v3.cu",
+                name, src, bdir = ("litetopk_dsa_b200_v3", "dsa_litetopk.cu",
                                    "/root/.cache/litetopk_v3_build")
                 incs = [_DSA_DIR, os.path.join(dg25, "deep_gemm/include"),
                         os.path.join(dg25, "third-party/cutlass/include")]

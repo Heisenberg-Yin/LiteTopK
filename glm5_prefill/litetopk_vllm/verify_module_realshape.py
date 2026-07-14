@@ -6,7 +6,7 @@ import sys
 
 import torch
 
-sys.path.insert(0, os.environ.get("LITETOPK_MODULE_DIR", "/opt/simtopk_repro/glm5_prefill/litetopk_vllm"))
+sys.path.insert(0, os.environ.get("LITETOPK_MODULE_DIR", "/opt/litetopk_repro/glm5_prefill/litetopk_vllm"))
 os.environ.setdefault("VLLM_LITETOPK_MIN_S", "0")
 os.environ.setdefault("VLLM_LITETOPK_SAMPLE", "65536")
 os.environ.setdefault("VLLM_LITETOPK_V2", "0")

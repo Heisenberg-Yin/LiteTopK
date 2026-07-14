@@ -1,5 +1,5 @@
 --- /home/user/vllm-v0.23.0/vllm/v1/attention/backends/mla/indexer.py	2026-07-08 15:55:22.043300910 +0000
-+++ /opt/simtopk_repro/vllm/vllm/v1/attention/backends/mla/indexer.py	2026-07-13 00:22:26.889592847 +0000
++++ /opt/litetopk_repro/vllm/vllm/v1/attention/backends/mla/indexer.py	2026-07-13 00:22:26.889592847 +0000
 @@ -518,7 +518,15 @@
              prefill_query_lens_cpu = torch.diff(
                  query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]

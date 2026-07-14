@@ -4,7 +4,7 @@ Defaults: batch = 128 concurrent queries, fp32 output values (fp16 inputs).
 
 Task (paper spec): batch = 64 concurrent queries over a shared corpus of
 768-d embeddings, corpus size M in {1M, 2M, 4M, 5M}, k in {128, 1024, 8192,
-32768}. LiteTopK runs the flat-batch mode of tidal_sm100::fused_ip_gqa_sparse_b200
+32768}. LiteTopK runs the flat-batch mode of litetopk_sm100::fused_ip_sparse_b200
 (64 rows = 8 groups x QN=8, all mapped to the single corpus via q_group_size);
 the D=768 scan uses the kernel's 256-wide D-chunk pipeline.
 
@@ -25,8 +25,8 @@ import numpy as np
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_HERE, "litetopk_engine"))
-from tidal_hopper_ops import fused_ip_gqa_sparse_b200  # noqa: E402
+sys.path.insert(0, _HERE)
+from litetopk_ops import fused_ip_sparse_b200  # noqa: E402
 
 DATA = os.environ.get("MARSCO_DATA", "/data/marsco")
 
@@ -104,10 +104,10 @@ def main():
     #   QN64+BM256 (single-pass corpus, 2 math warpgroups, grid 296) wins
     #   everywhere except small-M large-k, where the QN8 warp-queue path with
     #   BM=256 wins (emission-bound: queue batching + 8-way group parallelism).
-    if "TIDAL_FLAT_QN" not in os.environ:
+    if "LITETOPK_FLAT_QN" not in os.environ:
         # Forced single engine shape: QN64+BM256 everywhere (no QN8 fallback).
-        os.environ["TIDAL_FLAT_QN"] = "64"
-        os.environ["TIDAL_BM"] = "256"
+        os.environ["LITETOPK_FLAT_QN"] = "64"
+        os.environ["LITETOPK_BM"] = "256"
         if args.num_ctas_x == 0:
             args.num_ctas_x = 296
     print(f"device={torch.cuda.get_device_name(0)} M={M} D={D} bs={q.shape[0]} k={k} "
@@ -116,10 +116,10 @@ def main():
     kv3 = base.unsqueeze(0)                            # [1, M, D] flat-batch layout
 
     if os.environ.get("BASELINE", "torch") == "oursdense":
-        import tidal_hopper_ops as _ops
+        import litetopk_ops as _ops
         _ops._ensure_loaded()
         def baseline():
-            return torch.ops.tidal_sm100.dense_scores(q, kv3, 0).topk(k, dim=-1).indices
+            return torch.ops.litetopk_sm100.dense_scores(q, kv3, 0).topk(k, dim=-1).indices
         base_name = "ours-dense qk+topk"
     else:
         def baseline():
@@ -128,7 +128,7 @@ def main():
     ref = baseline()
 
     def ours():
-        return fused_ip_gqa_sparse_b200(
+        return fused_ip_sparse_b200(
             q, kv3, k, num_buckets=args.num_buckets, sample_size=sample,
             refresh_every=args.refresh, num_ctas_x=args.num_ctas_x,
             sample_mode=1, out_fp32=os.environ.get("OUT_FP32", "1") == "1")[1]  # strided sample: MARCO corpus ordering makes tail windows unrepresentative

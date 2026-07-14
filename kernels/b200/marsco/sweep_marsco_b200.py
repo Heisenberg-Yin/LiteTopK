@@ -24,9 +24,9 @@ import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
-sys.path.insert(0, os.path.join(_HERE, "litetopk_engine"))
+sys.path.insert(0, _HERE)
 from bench_marsco_b200 import read_fvecs, load_base_fp16  # noqa: E402
-from tidal_hopper_ops import fused_ip_gqa_sparse_b200  # noqa: E402
+from litetopk_ops import fused_ip_sparse_b200  # noqa: E402
 
 
 def cuda_time(fn, warmup, iters):
@@ -72,7 +72,7 @@ def main():
                         for smult in (8, 16):
                             sample = min(M, max(16384, min(smult * k, 262144)))
                             def run():
-                                return fused_ip_gqa_sparse_b200(
+                                return fused_ip_sparse_b200(
                                     q, kv3, k, num_buckets=64, sample_size=sample,
                                     refresh_every=rf, num_ctas_x=ctas,
                                     sample_mode=1, qn=qn, bm=bm)[1]

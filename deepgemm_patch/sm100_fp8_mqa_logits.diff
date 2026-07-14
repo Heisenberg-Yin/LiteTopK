@@ -1,5 +1,5 @@
 --- /opt/venvs/deepgemm/lib/python3.12/site-packages/deep_gemm/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh	2026-03-02 12:05:06.473536378 +0000
-+++ /opt/simtopk_repro/deepgemm_patch/sm100_fp8_mqa_logits.cuh	2026-07-12 16:39:58.383784419 +0000
++++ /opt/litetopk_repro/deepgemm_patch/sm100_fp8_mqa_logits.cuh	2026-07-12 16:39:58.383784419 +0000
 @@ -278,7 +278,10 @@
          const auto& v_offset = lane_idx;
  

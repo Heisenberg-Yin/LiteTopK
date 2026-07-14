@@ -481,36 +481,20 @@ def _arange32(n, dev):
 
 
 def stash_carry(hot_key, idx, S):
-    """Seed a layer's hot carry from the OFFICIAL path's topk output, called
-    by the container on the LAST official chunk before MIN_S. The
-    official->ours boundary is deterministic, so this one seed is all the
-    first ours-chunk needs to run HOT (no cold start, no cold prefix). Stored
-    compressed (voted hot columns, ~64KB/layer).
-
-    The vote+topk selection and the store run on a per-device SIDE STREAM
-    (async): seeding overlaps the model forward instead of stalling the
-    official path. The consumer (try_chunk's carry read) waits on the stored
-    event before touching the carry."""
+    """Seed a layer's hot carry from the OFFICIAL path's topk output (called
+    by the container on the LAST official chunk before MIN_S). The boundary
+    ours-band call then runs HOT: no cold start, no cap-floor spike, tighter
+    thresholds than the cold prefix path. Stored compressed (voted hot
+    columns, ~64KB/layer)."""
     if not (HOTONLY and HOTSAMPLE > 0):
         return
     dev = idx.device
     nv = int(S)
-    ss = _HOT_STREAM.get(str(dev))
-    if ss is None:
-        ss = torch.cuda.Stream(device=dev)
-        _HOT_STREAM[str(dev)] = ss
-    ss.wait_stream(torch.cuda.current_stream())  # see the just-written topk
-    idx.record_stream(ss)                        # keep it alive for the read
-    with torch.cuda.stream(ss):
-        # separate slab (_vote_hist hot=True): the main stream reuses its own
-        # slab, so a shared one would race the concurrent zero_/scatter_add_.
-        votes = _vote_hist(nv, dev, hot=True)
-        hpf = idx.reshape(-1).long().clamp_(0, nv - 1)
-        votes.scatter_add_(0, hpf, torch.ones_like(hpf, dtype=torch.int32))
-        hot = votes.topk(min(HOTSAMPLE, nv)).indices
-        ev = torch.cuda.Event()
-        ev.record()
-    _HOT_CARRY[(str(dev), hot_key)] = (hot, nv, ev)
+    votes = _vote_hist(nv, dev)
+    hpf = idx.reshape(-1).long().clamp_(0, nv - 1)
+    votes.scatter_add_(0, hpf, torch.ones_like(hpf, dtype=torch.int32))
+    hot = votes.topk(min(HOTSAMPLE, nv)).indices
+    _HOT_CARRY[(str(dev), hot_key)] = (hot, nv, None)
 
 
 def try_merged(q, k, k_scale, weights, out_idx, topk, S, Qtot,
@@ -577,11 +561,6 @@ def try_chunk(q, k, k_scale, weights, ks, ke, out_idx, topk,
             _hc2 = _HOT_CARRY.get((str(q.device), hot_key))
             if _hc2 is not None and (_hc2[1] <= _kem2 or _hc2[1] == S):
                 hot_prev = _hc2[0]
-                if _hc2[2] is not None:
-                    # async boundary seed (stash_carry side stream): order the
-                    # main stream behind the seed's topk and keep it alive.
-                    torch.cuda.current_stream().wait_event(_hc2[2])
-                    hot_prev.record_stream(torch.cuda.current_stream())
         head = SAMPLE
         if num_reqs is not None and ke_min_hint is not None:
             if num_reqs != 1:
@@ -692,14 +671,17 @@ def try_chunk(q, k, k_scale, weights, ks, ke, out_idx, topk,
                 head = int(hot_idx.shape[0])
                 ks_scan = ks0  # scan the FULL range
         else:
-            # PREFIX DELETED (2026-07-13, user directive): the method is pure
-            # hot-start. Without a hot carry there is no cold-prefix sample to
-            # estimate a threshold from -- the first ours-chunk is bootstrapped
-            # by stash_carry from the last official chunk's top-k ("his
-            # method"), and any chunk that still reaches here with no carry
-            # defers to the official dense path (correct, just unaccelerated).
-            return False
+            _smp, slog = (k[:head], k_scale[:head]), None
+            ks_scan = keh  # scan starts after the sampled prefix
         cap_eff = cap if cap is not None else CAP
+        if HOTONLY and HOTSAMPLE > 0 and not hot_here:
+            # any call the hot branch did NOT serve (cold start, or the
+            # S=262144 boundary chunk that runs PREFIX mode where the carry
+            # is ignored): it falls through to the exact probe/prefix path,
+            # whose candidate counts are ~K*span/sample (5-16K at 262K) --
+            # the 2xK hot cap would silently truncate = recall breach.
+            # One-off flagship cap.
+            cap_eff = max(cap_eff, CAP_CEIL)
         _repair_pack = None
         probe_group = probe_add_max = 0  # legacy paths never set these
         st = None
