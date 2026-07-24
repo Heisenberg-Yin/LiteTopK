@@ -1,5 +1,5 @@
---- /home/user/vllm-v0.23.0/vllm/model_executor/layers/sparse_attn_indexer.py	2026-07-08 15:55:21.971300910 +0000
-+++ /opt/litetopk_repro/vllm/vllm/model_executor/layers/sparse_attn_indexer.py	2026-07-13 00:25:04.221591769 +0000
+--- vllm/model_executor/layers/sparse_attn_indexer.py
++++ vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -2,6 +2,8 @@
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  """Custom Sparse Attention Indexer layers."""
@@ -26,7 +26,7 @@
 +    if _LITETOPK_MOD is None:
 +        try:
 +            import sys as _sys
-+            _p = "/opt/litetopk_repro/glm5_prefill/litetopk_vllm"
++            _p = os.environ.get("LITETOPK_MODULE_DIR", "/opt/simtopk_repro/glm5_prefill/litetopk_vllm")
 +            if _p not in _sys.path:
 +                _sys.path.insert(0, _p)
 +            import litetopk_indexer as _LITETOPK_MOD_  # noqa: N813
@@ -49,7 +49,7 @@
 +    if _LITETOPK_MOD is None:
 +        try:
 +            import sys as _sys
-+            _p = "/opt/litetopk_repro/glm5_prefill/litetopk_vllm"
++            _p = os.environ.get("LITETOPK_MODULE_DIR", "/opt/simtopk_repro/glm5_prefill/litetopk_vllm")
 +            if _p not in _sys.path:
 +                _sys.path.insert(0, _p)
 +            import litetopk_indexer as _LITETOPK_MOD_  # noqa: N813

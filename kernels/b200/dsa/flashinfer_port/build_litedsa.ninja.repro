@@ -1,0 +1,75 @@
+ninja_required_version = 1.3
+name = dsa_indexer
+cuda_home = /usr/local/cuda
+cxx = c++
+nvcc = $cuda_home/bin/nvcc
+cxx_launcher = 
+nvcc_launcher = 
+
+common_cflags = -DPy_LIMITED_API=0x03090000 $
+    -D_GLIBCXX_USE_CXX11_ABI=1 $
+    -I/data01/home/ziqi.yin/litetopk_repro/kernels/b200/dsa/flashinfer_port/csrc -I/data01/home/ziqi.yin/litetopk_repro/kernels/b200/dsa/flashinfer_port/csrc/vendor_fmla -I/data01/home/ziqi.yin/litetopk_repro/kernels/b200/dsa/flashinfer_port/csrc/vendor_fmla/kerutils/include -I/data01/home/ziqi.yin/litetopk_repro/kernels/b200/dsa/flashinfer_port/include $
+    -I/data01/home/ziqi.yin/flashinfer-litetopk/cccl/cub $
+    -I/data01/home/ziqi.yin/flashinfer-litetopk/cccl/libcudacxx/include $
+    -I/data01/home/ziqi.yin/flashinfer-litetopk/cccl/thrust $
+    -isystem /root/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/include/python3.12 $
+    -isystem $cuda_home/include $
+    -isystem /opt/vllm-venv/lib/python3.12/site-packages/tvm_ffi/include $
+    -isystem /opt/vllm-venv/lib/python3.12/site-packages/tvm_ffi/include $
+    -isystem /data01/home/ziqi.yin/vllm-litetopk-longcat/.deps/cutlass-src/include -isystem /data01/home/ziqi.yin/vllm-litetopk-longcat/.deps/cutlass-src/tools/util/include -isystem /data01/home/ziqi.yin/litetopk_repro/kernels/b200/dsa/flashinfer_port/include -isystem /data01/home/ziqi.yin/flashinfer-litetopk/include $
+    -isystem /data01/home/ziqi.yin/flashinfer-litetopk/csrc $
+    -isystem /data01/home/ziqi.yin/vllm-litetopk-longcat/.deps/cutlass-src/include $
+    -isystem /data01/home/ziqi.yin/vllm-litetopk-longcat/.deps/cutlass-src/tools/util/include $
+    -isystem /data01/home/ziqi.yin/flashinfer-litetopk/spdlog/include
+cflags = $common_cflags $
+    -fPIC $
+    -std=c++17 $
+    -Wno-switch-bool $
+    -DNDEBUG $
+    -O3
+post_cflags =
+cuda_cflags = $common_cflags $
+    --compiler-options=-fPIC $
+    --expt-relaxed-constexpr $
+    -static-global-template-stub=false $
+    -DFLASHINFER_ENABLE_FP8_E8M0 $
+    -DFLASHINFER_ENABLE_FP4_E2M1 $
+    -std=c++17 $
+    --threads=1 $
+    -use_fast_math $
+    -Xfatbin=-compress-all $
+    -DFLASHINFER_ENABLE_F16 $
+    -DFLASHINFER_ENABLE_BF16 $
+    -DFLASHINFER_ENABLE_FP8_E4M3 $
+    -DFLASHINFER_ENABLE_FP8_E5M2 $
+    -DNDEBUG $
+    -O3 $
+    -gencode=arch=compute_100a,code=sm_100a $
+    -DFLASHINFER_ENABLE_FP8_E8M0 $
+    -DFLASHINFER_ENABLE_FP4_E2M1 $
+    --expt-relaxed-constexpr $
+    --expt-extended-lambda
+cuda_post_cflags =
+ldflags = -shared $
+    -L$cuda_home/lib64 $
+    -L$cuda_home/lib64/stubs $
+    -lcudart $
+    -lcuda
+
+rule compile
+  command = $cxx_launcher $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule cuda_compile
+  command = $nvcc_launcher $nvcc --generate-dependencies-with-compile -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule link
+  command = $cxx $in $ldflags -o $out
+
+build /tmp/litedsa_build/dsa_indexer_dsa_indexer_jit_binding.cuda.o: cuda_compile /data01/home/ziqi.yin/litetopk_repro/kernels/b200/dsa/flashinfer_port/csrc/litedsa_jit_binding.cu
+
+build /tmp/litedsa_build/dsa_indexer.so: link /tmp/litedsa_build/dsa_indexer_dsa_indexer_jit_binding.cuda.o
+default /tmp/litedsa_build/dsa_indexer.so

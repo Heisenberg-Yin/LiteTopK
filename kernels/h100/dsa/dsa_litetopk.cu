@@ -1,8 +1,8 @@
-// LiteTopK DSA V3 hybrid host wrapper: DeepGEMM-2.5 scoring loop + V1 KV-split;
-// scoring kernel (sm100_dsa_litetopk.cuh) with the sparse candidate epilogue,
-// plus the architecture-agnostic radix-select post-kernels (copied verbatim
-// from dsa_litetopk.cu). Build against the DeepGEMM 2.5 include tree + its
-// bundled CUTLASS (NOT the legacy deep_gemm include tree V1 uses).
+// LiteTopK DSA V3 host wrapper — H100 (SM90) port of the B200 file.
+// Scoring kernel is sm90_dsa_litetopk.cuh (WGMMA); every other kernel in this
+// file (fused seed/prep, radix selects, refresh) is architecture-agnostic and
+// copied VERBATIM from kernels/b200/dsa/dsa_litetopk.cu. Build against the
+// DeepGEMM 2.5 include tree + its bundled CUTLASS, -arch=sm_90a.
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
@@ -15,7 +15,7 @@
 #include <optional>
 #include <tuple>
 
-#include "sm100_dsa_litetopk.cuh"
+#include "sm90_dsa_litetopk.cuh"
 
 namespace {
 
@@ -72,7 +72,7 @@ static inline int align_up(int x, int a) { return (x + a - 1) / a * a; }
 constexpr int NUM_HEADS = 32;
 constexpr int HEAD_DIM = 128;
 constexpr int BLOCK_Q = 4;         // 128 q*h rows per UMMA tile / 32 heads
-constexpr int BLOCK_KV = 256;
+constexpr int BLOCK_KV = 128;      // = 64 (WGMMA M) x 2 math warpgroups
 constexpr int NUM_Q_STAGES = 1;   // one q-block per CTA
 #ifndef DSA_V3_KV_STAGES
 #define DSA_V3_KV_STAGES 4
@@ -82,8 +82,8 @@ constexpr int NUM_Q_STAGES = 1;   // one q-block per CTA
 #endif
 constexpr int NUM_KV_STAGES = DSA_V3_KV_STAGES;
 constexpr int SPEC_THREADS = 128;
-constexpr int MATH_THREADS = 256;  // 2 math warpgroups on SM100
-constexpr int NUM_SMS = 148;       // B200
+constexpr int MATH_THREADS = 256;  // 2 math warpgroups (each owns one m64 tile)
+constexpr int NUM_SMS = 132;       // H100 SXM
 
 __global__ void seed_bcount_kernel(
     const float* __restrict__ seed_val,
@@ -616,7 +616,9 @@ static int compute_smem_bytes() {
     const int smem_w  = BLOCK_Q * NUM_HEADS * esz_f32;
     const int smem_kv = BLOCK_KV * HEAD_DIM * esz_fp8;
     const int smem_ks = align_up(BLOCK_KV * esz_f32, 512);
-    const int num_barriers = NUM_Q_STAGES * 2 + NUM_KV_STAGES * 2 + (MATH_THREADS / 128) * DSA_UMMA_STAGES * 2;
+    // SM90: no UMMA full/empty barrier pair (WGMMA is issued by the math
+    // warpgroups themselves).
+    const int num_barriers = NUM_Q_STAGES * 2 + NUM_KV_STAGES * 2;
     const int smem_barriers = num_barriers * 8;
 #ifdef DSA_PERSIST
     const int smem_slots = 8 * (int)sizeof(uint32_t);  // + done_qb, ack[2]
@@ -724,7 +726,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk(
                         NUM_HEADS, seq_len, NUM_HEADS, BLOCK_Q, NUM_HEADS, 0);
 
     const int smem = compute_smem_bytes();
-    auto kernel = &dsa_litetopk::sm100_dsa_litetopk<
+    auto kernel = &dsa_litetopk::sm90_dsa_litetopk<
         NUM_HEADS, HEAD_DIM, BLOCK_Q, BLOCK_KV, NUM_Q_STAGES, NUM_KV_STAGES,
         NUM_SMS, SPEC_THREADS, MATH_THREADS>;
     C10_CUDA_CHECK(cudaFuncSetAttribute((void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
@@ -927,7 +929,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk_
                         NUM_HEADS, seq_len, NUM_HEADS, BLOCK_Q, NUM_HEADS, 0);
 
     const int smem = compute_smem_bytes();
-    auto kernel = &dsa_litetopk::sm100_dsa_litetopk<
+    auto kernel = &dsa_litetopk::sm90_dsa_litetopk<
         NUM_HEADS, HEAD_DIM, BLOCK_Q, BLOCK_KV, NUM_Q_STAGES, NUM_KV_STAGES,
         NUM_SMS, SPEC_THREADS, MATH_THREADS>;
     C10_CUDA_CHECK(cudaFuncSetAttribute((void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));

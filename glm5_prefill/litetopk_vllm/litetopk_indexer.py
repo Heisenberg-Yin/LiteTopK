@@ -7,7 +7,7 @@ Replaces (per prefill chunk, when the context is long enough):
     ops.top_k_per_row_prefill(logits, ...)       # reads it all back
 with:
     sample-prefix scoring (official kernel, [Q, SAMPLE]) -> per-row threshold
-    fused sparse scan (LiteTopK marsco kernel, only candidates written)
+    fused sparse scan (LiteTopK litetopk kernel, only candidates written)
     compact threshold-aware radix select -> top-k indices
 
 Env knobs:
@@ -60,13 +60,6 @@ SMARGIN = float(os.environ.get("VLLM_LITETOPK_SMARGIN", "1.5"))
 # probabilistic and its speed is data-distribution-dependent -- opt-in only,
 # for comparison runs (VLLM_LITETOPK_STRIDED_EXACT=0).
 STRIDED_EXACT = os.environ.get("VLLM_LITETOPK_STRIDED_EXACT", "1") == "1"
-# Certificate mode (strided, Q>=2368 so each row has a single scanner CTA):
-# run the scan on the PREDICTED gate (fast trajectory), then a repair pass
-# re-launches the kernel which per row either verifies the exactness proof
-# (scan emissions + predicted-qualifying seeds >= topk, count within cap;
-# ~50us no-op when all rows certify) or re-scans that row under the exact
-# subset bound. Recall is guaranteed by construction at predicted speed.
-CERT = os.environ.get("VLLM_LITETOPK_CERT", "0") == "1"
 # Strided probe size (STRIDED/auto mode): the proportional-quantile target is
 # only ~K*s/S points, so 16K columns suffice (±10% noise, covered by SMARGIN).
 SSAMPLE = int(os.environ.get("VLLM_LITETOPK_SSAMPLE", "16384"))
@@ -93,11 +86,10 @@ _AUTO = {"strided": False, "n": 0}
 # prepended ABOVE the sample max). Pair with a proportionally larger NB to
 # keep bucket width unchanged (e.g. HEADROOM=1.0 + NB=512 == today's width).
 HEADROOM = float(os.environ.get("VLLM_LITETOPK_HEADROOM", "0.0"))
-PROBE_MODE = os.environ.get("VLLM_LITETOPK_PROBE_MODE", "htr")  # htr|strided
 MERGE_CAP = int(os.environ.get("VLLM_LITETOPK_MERGE_CAP", "32768"))
 MEMSTATS = os.environ.get("VLLM_LITETOPK_MEMSTATS", "0") == "1"
 # OVF_LOG: print the running max of sampled per-row candidate counts (from
-# the existing deferred 1-in-8 probe; sync-free). Sizes MERGE_CAP/SCAN_CAP.
+# the existing deferred 1-in-8 probe; sync-free). Sizes MERGE_CAP.
 OVF_LOG = os.environ.get("VLLM_LITETOPK_OVF_LOG", "0") == "1"
 # HOT_PREFETCH: run part-0's hot selection (votes+topk+gather) on a module
 # side stream so it overlaps the PREVIOUS layer's scan instead of sitting at
@@ -123,26 +115,6 @@ PREP_SUB = int(os.environ.get("VLLM_LITETOPK_PREP_SUB", "1"))
 # time (2.1GB -> ~0.5GB transient), exactness untouched (both stages are
 # row-independent). 0 = off (whole-Q slog as before).
 PREP_TILE = int(os.environ.get("VLLM_LITETOPK_PREP_TILE", "2048"))
-# Compact repair v2 (cert mode only), SYNC-FREE: the main candidate buffer
-# shrinks to SCAN_CAP entries/row (cap overflow = certificate failure by
-# construction: the kernel counts true volume but clamps writes). Failed rows
-# are compacted ON DEVICE (cumsum+scatter, fixed shapes) into a standing
-# [POOL, REPAIR_CAP] pool and re-scanned under the exact bound; idle pool
-# slots get ke=0 so the kernel's empty-range path makes them no-ops. Full-Q
-# coverage by construction via ceil(Q/POOL) rounds — the CPU never learns
-# n_fail and never waits (v1's one nonzero() sync cost E2E +21%: it broke
-# vLLM's CPU run-ahead; kernel-bench could not see it).
-COMPACT_REPAIR = os.environ.get("VLLM_LITETOPK_COMPACT_REPAIR", "0") == "1"
-SCAN_CAP = int(os.environ.get("VLLM_LITETOPK_SCAN_CAP", "8192"))
-REPAIR_CAP = int(os.environ.get("VLLM_LITETOPK_REPAIR_CAP", "49152"))
-REPAIR_POOL = int(os.environ.get("VLLM_LITETOPK_REPAIR_POOL", "2048"))
-# Adaptive candidate cap ("paged append" at call granularity): the buffer
-# starts at CAP_MIN and grows/shrinks across calls, driven by the async
-# overflow probe (no host sync — the +21% lesson). Within the triggering
-# call, rows over cap fail the certificate and are repaired exactly, so
-# recall stays 100% by construction. Active only on cert+compact calls.
-CAP_ADAPT = os.environ.get("VLLM_LITETOPK_CAP_ADAPT", "1") == "1"
-CAP_MIN = int(os.environ.get("VLLM_LITETOPK_CAP_MIN", "16384"))
 # Split big merged calls into QSPLIT-row scans: candidate/scratch buffers
 # scale with rows-per-scan (8192 -> 2048 = 4x smaller), total scan work
 # unchanged (same CTA count overall). Certificate stays valid at 2048 by
@@ -166,39 +138,15 @@ HOTONLY = os.environ.get("VLLM_LITETOPK_HOTONLY", "1") == "1"
 # deduplicated, selection cost zero). Coverage 46% vs voted-4096's 75%.
 HOTLAST = os.environ.get("VLLM_LITETOPK_HOTLAST", "0") == "1"
 _HOT_CARRY = {}  # 0=off; 4096 = memory-lean (1.2% tail); 2048 = 15% tail, do not use
-CAP_CEIL = int(os.environ.get("VLLM_LITETOPK_CAP_CEIL", "49152"))
-_CAP = {"cap": CAP_MIN, "low": 0, "last_m": 0}
 # OUR METHOD default kernel = GATE4 bucket-gate (build + select consistent):
 # set once here so every VLLM_LITETOPK_XFLAGS read below (build flags + _BG4)
 # sees it unless the caller overrides.
 os.environ.setdefault("VLLM_LITETOPK_XFLAGS", "DSA_BUCKET_GATE4=1")
-# Bulk-drain build (XFLAGS=DSA_BULK_DRAIN=1): scan stores candidate indices
-# RAW (compacted space); select maps winners back via probe args + seed base.
-_BULK = "DSA_BULK_DRAIN" in os.environ.get("VLLM_LITETOPK_XFLAGS", "")
 # GATE4 build: the scan writes BUCKET-SPACE floats as cand_val (affine
 # order-preserving); select must run with o'=0, inv'=1, th'=(th-o)*inv.
 # Valid only for emit_lim==0 modes (prefix seeds would be x-space = mixed).
 _BG4 = "DSA_BUCKET_GATE4" in os.environ.get("VLLM_LITETOPK_XFLAGS", "")
-_LANE = "DSA_LANE_EMIT" in os.environ.get("VLLM_LITETOPK_XFLAGS", "")
-_DIRECT = "DSA_DIRECT_EMIT" in os.environ.get("VLLM_LITETOPK_XFLAGS", "")
-_RAWIDX = _BULK or _LANE or _DIRECT  # raw compacted indices; select remaps
 
-_REPAIR_BUFS = {}
-
-
-def _repair_bufs(Q, P, rcap, nb, dev):
-    key = (str(dev), P, rcap, nb)
-    b = _REPAIR_BUFS.get(key)
-    if b is None or b["q"] < Q:
-        b = {"q": Q,
-             "cv": torch.empty(P, rcap, device=dev),
-             "ci": torch.empty(P, rcap, dtype=torch.int32, device=dev),
-             "bc": torch.zeros(P, nb, dtype=torch.int32, device=dev),
-             "flist": torch.zeros(Q + 1, dtype=torch.int64, device=dev),
-             "src": torch.arange(Q, dtype=torch.int64, device=dev),
-             "slot_ar": torch.arange(Q, dtype=torch.int64, device=dev)}
-        _REPAIR_BUFS[key] = b
-    return b
 PREP_MARGIN = float(os.environ.get("VLLM_LITETOPK_PREP_MARGIN", "1.15"))
 _COMPACT_IDX = {}  # (dev, S, pstp, npage) -> kept-position index tensor
 
@@ -244,13 +192,8 @@ def _ext():
                                    "/root/.cache/litetopk_v3_build")
                 incs = [_DSA_DIR, os.path.join(dg25, "deep_gemm/include"),
                         os.path.join(dg25, "third-party/cutlass/include")]
-            elif KERNEL == "v2":
-                name, src, bdir = ("litetopk_dsa_b200_v2", "dsa_marsco_v2.cu",
-                                   "/root/.cache/litetopk_v2_build")
-                incs = [_DSA_DIR, os.path.join(dg25, "deep_gemm/include"),
-                        os.path.join(dg25, "third-party/cutlass/include")]
             else:
-                name, src, bdir = ("litetopk_dsa_b200_vllm", "dsa_marsco.cu", _BUILD_DIR)
+                name, src, bdir = ("litetopk_dsa_b200_vllm", "dsa_litetopk.cu", _BUILD_DIR)
                 incs = [_DSA_DIR,
                         os.environ.get("DEEPGEMM_INCLUDE", "/opt/venvs/deepgemm/lib/python3.12/site-packages/deep_gemm/include"),
                         os.environ.get("CUTLASS_INCLUDE", "/opt/cutlass/include")]
@@ -293,8 +236,8 @@ def plan_sampling(Q, ke_min):
     """Sampling policy, shared by try_chunk AND the container's merged path
     (which must size the probe pre-gather before calling in). Returns
     (use_strided, probe_head). Policy 2026-07-13: S >= 400K goes
-    certificate-strided with a 64K representative probe (drift-proof,
-    overflow-proof, predicted-speed with constructive recall); below that
+    strided with a 64K representative probe (drift-proof,
+    overflow-proof); below that
     prefix-64K exact. The auto drift guard (AUTO_XK) can still force
     strided anywhere."""
     use_strided = plan_strided(Q)
@@ -332,40 +275,10 @@ def _deferred_overflow_poll():
     """Non-blocking check of the previous chunk's candidate-overflow probe."""
     global _PENDING_OVF
     if _PENDING_OVF is not None:
-        ev, pinned, capv, kk, was_strided, adaptive = _PENDING_OVF
+        ev, pinned, capv, kk, was_strided = _PENDING_OVF
         if ev.query():  # finished long ago; no sync
             mx = int(pinned[0])
-            if adaptive:
-                # paged-append policy: grow toward the TRUE max (the kernel
-                # counts past the cap) with 25% headroom; shrink with a long
-                # hysteresis. Overflow here is normal operation: those rows
-                # were certificate-repaired exactly.
-                if mx > (capv * 2) // 3:
-                    # 50% headroom over the SAMPLED max: 1-in-8 sampling
-                    # underestimates the true max; converging on the edge
-                    # leaves borderline repairs (measured +-2.5ms run
-                    # variance at 512K with x1.25 headroom).
-                    tgt = max(mx + (mx >> 1), capv * 2 if mx > capv else 0)
-                    tgt = min(((tgt + 2047) // 2048) * 2048, CAP_CEIL)
-                    if tgt > _CAP["cap"]:
-                        _CAP["cap"] = tgt
-                        _CAP["last_m"] = _AUTO["m"]
-                        print(f"[litetopk] cand cap -> {tgt} (max seen {mx})",
-                              flush=True)
-                    _CAP["low"] = 0
-                elif mx < capv // 3:
-                    _CAP["low"] += 1
-                    if _CAP["low"] >= 16:
-                        tgt = max(CAP_MIN, ((mx * 2 + 2047) // 2048) * 2048)
-                        if tgt < _CAP["cap"]:
-                            _CAP["cap"] = tgt
-                            _CAP["last_m"] = _AUTO["m"]
-                            print(f"[litetopk] cand cap <- {tgt} (max seen {mx})",
-                                  flush=True)
-                        _CAP["low"] = 0
-                else:
-                    _CAP["low"] = 0
-            elif mx > capv:
+            if mx > capv:
                 print(f"[litetopk] WARNING: candidate overflow ({mx} > cap {capv}); "
                       f"recall may dip on that chunk — raise VLLM_LITETOPK_CAP", flush=True)
             if OVF_LOG and mx > _AUTO.get("mxmax", 0):
@@ -440,35 +353,9 @@ def _prep_bufs(Q, nb, cap, dev):
              "inv": torch.empty(qm, device=dev),
              "th": torch.empty(qm, dtype=torch.int32, device=dev),
              "bc": torch.empty(qm, nb, dtype=torch.int32, device=dev),
-             "cc": torch.empty(qm, dtype=torch.int32, device=dev),
-             "ths": torch.empty(qm, dtype=torch.int32, device=dev),
-             "sp": torch.empty(qm, dtype=torch.int32, device=dev),
-             "st": torch.empty(qm, dtype=torch.int32, device=dev)}
+             "cc": torch.empty(qm, dtype=torch.int32, device=dev)}
         _PREP_BUFS[key] = b
     return b
-_PROBE_IDX = {}  # (dev, lo, hi, n, mode) -> sorted int64 positions
-
-
-def _probe_idx(n, lo, hi, dev):
-    """n probe positions in [lo, hi): htr = tail third + random middle
-    (deterministic), strided = even spread. Cached; sorted for locality."""
-    key = (str(dev), lo, hi, n, PROBE_MODE)
-    p = _PROBE_IDX.get(key)
-    if p is None:
-        if PROBE_MODE == "strided":
-            stp = max((hi - lo) // n, 1)
-            p = torch.arange(lo, lo + stp * n, stp, dtype=torch.int64, device=dev)[:n]
-        else:  # htr: head window already sampled; tail + random middle
-            nt = n // 3
-            tail = torch.arange(hi - nt, hi, dtype=torch.int64, device=dev)
-            g = torch.Generator(device=dev)
-            g.manual_seed(0x5EED)
-            mid = torch.randint(lo, hi - nt, (n - nt,), generator=g,
-                                dtype=torch.int64, device=dev)
-            p = torch.cat([mid, tail]).sort().values
-        p = p.clamp_(lo, hi - 1).contiguous()
-        _PROBE_IDX[key] = p
-    return p
 
 
 def _arange32(n, dev):
@@ -700,19 +587,17 @@ def try_chunk(q, k, k_scale, weights, ks, ke, out_idx, topk,
             # defers to the official dense path (correct, just unaccelerated).
             return False
         cap_eff = cap if cap is not None else CAP
-        _repair_pack = None
         probe_group = probe_add_max = 0  # legacy paths never set these
-        st = None
 
         def _slog_rows(r0, r1):
             return deep_gemm.fp8_fp4_mqa_logits(
                 (q[r0:r1], None), _smp, weights[r0:r1],
                 *_ks0_keh(r1 - r0, head, dev), clean_logits=False)
         tile = PREP_TILE if (PREP_TILE > 0 and not TWOSTEP
-                             and hasattr(ext, "seed_prep_marsco_")) else 0
+                             and hasattr(ext, "seed_prep_litetopk_")) else 0
         if slog is None and (tile == 0 or tile >= Q):
             slog, tile = _slog_rows(0, Q), 0  # whole-Q path (legacy/small)
-        if hasattr(ext, "seed_prep_marsco"):
+        if hasattr(ext, "seed_prep_litetopk"):
             # Fused prep (v3): one kernel does aminmax + histogram + threshold
             # + superset-seed emit + bcount; the scan then runs on the prepared
             # buffers. Replaces ~10 small ops / 6 passes over the sample.
@@ -720,8 +605,7 @@ def try_chunk(q, k, k_scale, weights, ks, ke, out_idx, topk,
             hist_stride = 1
             if use_strided and stp > 1:
                 # proportional quantile of the representative sample, + margin
-                cert = CERT and Q >= 2048
-                if STRIDED_EXACT and not cert:
+                if STRIDED_EXACT:
                     # exact subset bound: probe columns are a true subset of
                     # the row's range, so the probe's topk-th value can never
                     # be tighter than the global topk-th. No margin, recall
@@ -788,41 +672,26 @@ def try_chunk(q, k, k_scale, weights, ks, ke, out_idx, topk,
             # WITH compaction: seeds ON (probe_stride_tok maps their indices)
             emit_lim = head if (probe_stride_tok > 0
                                 or not (use_strided and stp > 1)) else 0
-            if hasattr(ext, "seed_prep_marsco_"):
-                cert_here = (use_strided and stp > 1 and CERT and Q >= 2048
-                             and emit_lim > 0)
-                if cert_here and COMPACT_REPAIR:
-                    if CAP_ADAPT:
-                        # adaptive "paged append": current cap from the async
-                        # feedback loop; overflow rows are cert-repaired.
-                        cap_eff = min(max(_CAP["cap"], CAP_MIN),
-                                      min(cap_eff, CAP_CEIL))
-                    else:
-                        cap_eff = min(cap_eff, SCAN_CAP)
+            if hasattr(ext, "seed_prep_litetopk_"):
                 _b = _prep_bufs(Q, NB, cap_eff, dev)
                 _cb = _cand_bufs(Q, cap_eff, dev)
                 o, inv, th = _b["o"][:Q], _b["inv"][:Q], _b["th"][:Q]
                 bcount = _b["bc"][:Q]
                 cand_val, cand_idx, cand_cnt = _cb["cv"][:Q], _cb["ci"][:Q], _b["cc"][:Q]
-                ths, sp, st = _b["ths"][:Q], _b["sp"][:Q], _b["st"][:Q]
                 if tile:
                     # row-tiled: slog lives only TILE rows at a time; the
                     # freed tile is reused by the allocator next iteration
                     for r0 in range(0, Q, tile):
                         r1 = min(r0 + tile, Q)
-                        ext.seed_prep_marsco_(
+                        ext.seed_prep_litetopk_(
                             _slog_rows(r0, r1), NB, kq, cap_eff, emit_lim,
                             HEADROOM, probe_stride_tok, hist_stride,
                             o[r0:r1], inv[r0:r1], th[r0:r1], bcount[r0:r1],
-                            cand_val[r0:r1], cand_idx[r0:r1], cand_cnt[r0:r1],
-                            topk if cert_here else 0, ths[r0:r1], sp[r0:r1])
+                            cand_val[r0:r1], cand_idx[r0:r1], cand_cnt[r0:r1])
                 else:
-                    ext.seed_prep_marsco_(slog, NB, kq, cap_eff, emit_lim, HEADROOM,
+                    ext.seed_prep_litetopk_(slog, NB, kq, cap_eff, emit_lim, HEADROOM,
                                           probe_stride_tok, hist_stride,
-                                          o, inv, th, bcount, cand_val, cand_idx, cand_cnt,
-                                          topk if cert_here else 0, ths, sp)
-                if cert_here or (_RAWIDX and probe_stride_tok > 0):
-                    st.copy_(cand_cnt)  # seed base: cert repair + select remap
+                                          o, inv, th, bcount, cand_val, cand_idx, cand_cnt)
                 if use_strided and stp > 1 and PAGE_PROBE and TWOSTEP:
                     # dense-half columns are re-scanned by the scan kernel:
                     # remove their histogram contribution so refresh counts
@@ -835,7 +704,7 @@ def try_chunk(q, k, k_scale, weights, ks, ke, out_idx, topk,
                                         dtype=torch.int32, device=dev))
             else:
                 o, inv, th, cand_val, cand_idx, cand_cnt, bcount = \
-                    ext.seed_prep_marsco(slog, NB, kq, cap_eff, emit_lim, HEADROOM,
+                    ext.seed_prep_litetopk(slog, NB, kq, cap_eff, emit_lim, HEADROOM,
                                          probe_stride_tok, hist_stride)
             if probe_extra:
                 # Exact double-count removal: probe columns live in the scan
@@ -851,68 +720,11 @@ def try_chunk(q, k, k_scale, weights, ks, ke, out_idx, topk,
             if gather_event is not None:
                 torch.cuda.current_stream().wait_event(gather_event)
             ke_scan_c = ke_scan.contiguous()
-            cv, ci, cc = ext.mqa_logits_dsa_marsco_ext(
+            cv, ci, cc = ext.mqa_logits_dsa_litetopk_ext(
                 q, k_scan, ksc_scan, weights, ks_scan, ke_scan_c,
                 o, inv, th, cand_val, cand_idx, cand_cnt, bcount, NB,
-                topk + probe_extra, REFRESH, 1 if cert_here else -1,
+                topk + probe_extra, REFRESH, -1,
                 probe_group, probe_add_max)
-            if cert_here and COMPACT_REPAIR:
-                # sync-free compact repair: build the failed-row list on
-                # device with FIXED shapes; scan pool rounds cover all Q rows
-                # by construction; idle slots are inert via ke=0 (the kernel's
-                # padded-row path). No host ever reads a device value here.
-                rb = _repair_bufs(Q, REPAIR_POOL, REPAIR_CAP, NB, dev)
-                fail = ((cc - st + sp) < topk) | (cc > cap_eff)
-                nf = fail.sum()                       # device scalar, never read
-                slot = torch.cumsum(fail, 0) - 1      # failed rows -> 0..nf-1
-                tgt = torch.where(fail, slot, torch.full_like(slot, Q))
-                fl = rb["flist"][:Q + 1]
-                fl.zero_()
-                fl.scatter_(0, tgt, rb["src"][:Q])    # compact list; [Q]=trash
-                valid_all = rb["slot_ar"][:Q] < nf
-                fl_rows = fl[:Q]  # exclude the trash slot from round slicing
-                P = REPAIR_POOL
-                packs = []
-                for r0 in range(0, Q, P):
-                    rows_r = fl_rows[r0:r0 + P]
-                    val_r = valid_all[r0:r0 + P]
-                    q_f = q.view(torch.uint8).index_select(0, rows_r) \
-                           .view(torch.float8_e4m3fn)
-                    w_f = weights.index_select(0, rows_r)
-                    o_f = o.index_select(0, rows_r)
-                    inv_f = inv.index_select(0, rows_r)
-                    thb_f = ths.index_select(0, rows_r)
-                    ks_f = ks_scan.index_select(0, rows_r)
-                    ke_f = ke_scan_c.index_select(0, rows_r) * val_r  # idle: ke=0
-                    cc_f = st.index_select(0, rows_r) * val_r         # seed base
-                    n_r = rows_r.shape[0]
-                    pool_cv, pool_ci = rb["cv"][:n_r], rb["ci"][:n_r]
-                    pool_cv[:, :cap_eff].copy_(cv.index_select(0, rows_r))
-                    pool_ci[:, :cap_eff].copy_(ci.index_select(0, rows_r))
-                    ext.mqa_logits_dsa_marsco_ext(
-                        q_f, k_scan, ksc_scan, w_f, ks_f, ke_f,
-                        o_f, inv_f, thb_f, pool_cv, pool_ci, cc_f,
-                        rb["bc"][:n_r], NB,
-                        topk + probe_extra, 0, -1, probe_group, probe_add_max)
-                    if _RAWIDX and probe_group > 0:
-                        _, idx_r = ext.compact_topk_min_thr_marsco(
-                            pool_cv, pool_ci, cc_f, o_f, inv_f, thb_f, NB, topk,
-                            probe_group, probe_add_max,
-                            st.index_select(0, rows_r).mul(val_r))
-                    else:
-                        _, idx_r = ext.compact_topk_min_thr_marsco(
-                            pool_cv, pool_ci, cc_f, o_f, inv_f, thb_f, NB, topk)
-                    packs.append((rows_r, val_r, idx_r))
-                _repair_pack = packs
-            elif cert_here:
-                # certificate repair: no-op launch (~50us) when every row
-                # carries the exactness proof; failed rows re-scan under the
-                # exact subset bound with refresh off.
-                ext.mqa_logits_dsa_marsco_ext(
-                    q, k_scan, ksc_scan, weights, ks_scan, ke_scan_c,
-                    o, inv, th, cand_val, cand_idx, cand_cnt, bcount, NB,
-                    topk + probe_extra, 0, -1, probe_group, probe_add_max,
-                    1, ths, st, sp)
         else:
             # Legacy prep path (v1/v2 kernels).
             mn, mx = torch.aminmax(slog, dim=1)
@@ -923,7 +735,7 @@ def try_chunk(q, k, k_scale, weights, ks, ke, out_idx, topk,
                 if not xs.is_contiguous():
                     xs = xs.contiguous()
                 col, cnt = _col_cnt(Q, head, dev)
-                sv, si = ext.compact_topk_min_idx_marsco(xs, col, cnt, topk)
+                sv, si = ext.compact_topk_min_idx_litetopk(xs, col, cnt, topk)
                 sv = sv.contiguous()
                 si = si.contiguous()
                 th_seed = sv.max(dim=1).values
@@ -933,7 +745,7 @@ def try_chunk(q, k, k_scale, weights, ks, ke, out_idx, topk,
                 si = i.to(torch.int32).contiguous()
                 th_seed = sv[:, -1]
             th = ((th_seed - o) * inv).floor().clamp(0, NB - 1).to(torch.int32).contiguous()
-            cv, ci, cc = ext.mqa_logits_dsa_marsco(
+            cv, ci, cc = ext.mqa_logits_dsa_litetopk(
                 q, k, k_scale, weights, ks_scan, ke.contiguous(), o, inv, th,
                 sv, si, NB, CAP, topk, REFRESH, -1)
         # Overflow safety WITHOUT a device sync: the kernel clamps candidate
@@ -946,12 +758,6 @@ def try_chunk(q, k, k_scale, weights, ks, ke, out_idx, topk,
         # load their cubins (cuLibraryLoadData, 10+ms each) on first launch —
         # that must land in warmup, not in anyone's timed region. (This was
         # the entire "probe pacing mystery": a lazy-loading warmup artifact.)
-        _adapt_here = (CAP_ADAPT and COMPACT_REPAIR and use_strided
-                       and stp > 1 and Q >= 2368)
-        # adaptation rides the standard 1-in-8 probe: growth lag is <= 8
-        # calls, each paying only a few ms of cert-repairs — every-call
-        # arming measured +1.0-1.3ms/call (max/mean kernels + python) and
-        # is not worth it.
         if _PENDING_OVF is None and ((_AUTO["m"] % PROBE_EVERY) == 0
                                      or _AUTO["m"] == 1):
             global _PROBE_RES
@@ -962,30 +768,15 @@ def try_chunk(q, k, k_scale, weights, ks, ke, out_idx, topk,
             pinned.copy_(torch.stack([cc.max(), cc.float().mean().int()]),
                          non_blocking=True)
             ev.record()
-            _PENDING_OVF = (ev, pinned, cap_eff, topk, stp > 1, _adapt_here)
-        if _RAWIDX and probe_group > 0:
-            _, idx = ext.compact_topk_min_thr_marsco(
-                cv, ci, cc, o, inv, th, NB, topk,
-                probe_group, probe_add_max, st)
-        elif _BG4:
+            _PENDING_OVF = (ev, pinned, cap_eff, topk, stp > 1)
+        if _BG4:
             # bucket-space values: rebase o'=0, inv'=1; th is a BUCKET INDEX
             # (int32) and bucket ids are space-invariant -- pass unchanged.
-            _, idx = ext.compact_topk_min_thr_marsco(
+            _, idx = ext.compact_topk_min_thr_litetopk(
                 cv, ci, cc, torch.zeros_like(o), torch.ones_like(inv),
                 th, NB, topk)
         else:
-            _, idx = ext.compact_topk_min_thr_marsco(cv, ci, cc, o, inv, th, NB, topk)
-        if _repair_pack is not None:
-            # sync-free scatter-back: pad with one trash row so idle pool
-            # slots (which all map to list index Q) can write harmlessly;
-            # valid slots each own a unique failed row.
-            scratch = torch.empty(Q + 1, topk, dtype=idx.dtype, device=dev)
-            scratch[:Q].copy_(idx)
-            for rows_r, val_r, idx_r in _repair_pack:
-                tgt_r = torch.where(val_r, rows_r, torch.full_like(rows_r, Q))
-                scratch.index_copy_(0, tgt_r, idx_r)
-            idx = scratch[:Q]
-
+            _, idx = ext.compact_topk_min_thr_litetopk(cv, ci, cc, o, inv, th, NB, topk)
         if CHECK:
             lg = deep_gemm.fp8_fp4_mqa_logits(
                 (q, None), (k, k_scale), weights, ks.contiguous(),

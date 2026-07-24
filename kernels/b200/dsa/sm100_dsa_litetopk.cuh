@@ -35,21 +35,54 @@ namespace dsa_litetopk {
 
 using namespace deep_gemm;
 
-#ifndef DSA_DIRECT_THRESH
-// Adaptive emit: rows with fewer hits than this per warp per GATE_STRIDE
-// window switch from the smem queue to direct ballot-group scatter.
-#define DSA_DIRECT_THRESH 8
-#endif
 #ifndef DSA_WARP_QUEUE_CAP
 #define DSA_WARP_QUEUE_CAP 64
 #endif
 
 #ifndef DSA_REFRESH_STRIDE
-#define DSA_REFRESH_STRIDE 16
+// KV blocks between threshold-refresh signals to the spare-warp daemon.
+// Swept 2026-07-22 (in-process, order-randomized, byte-identical control, two
+// independent runs agreeing to 0.1%): 2 is -2.3% at 1M and ~-1.5% at 256K, but
+// ONLY in combination with DSA_TMEM_ROWS=4 + 240/24 registers. On a
+// ROWS=2 / 232-40 build the same change is +0.8% at 1M.
+//
+// ncu 2x2 (fi_port/profile/stride_why/) explains it: the knob's effect is
+// build-independent -- it kills the daemon's __nanosleep (sleeping 6716 -> 14
+// M warp-cyc, -99.8%, in both) and its only cost is the *kv_progress_ptr store
+// (STS +3.657M measured vs +3.670M predicted from the block count; the
+// threadfence measures as free). What differs is whether anything can use the
+// freed issue slots: ROWS=4 turns them into +8.8% issue rate and -5.0% total
+// stall, while ROWS=2 -- already math-pipe-bound by its two 32dp32b64x loads
+// and two fences per accumulator -- gets math_pipe_throttle +23.7% and +0.8%
+// total stall. ROWS=4 is what creates the headroom STRIDE=2 fills.
+// Treat the three as one tuned point; re-sweep if any of them changes.
+#define DSA_REFRESH_STRIDE 2
 #endif
 
 #ifndef DSA_GATE_STRIDE
 #define DSA_GATE_STRIDE 16
+#endif
+#ifndef DSA_MATH_REGS
+#define DSA_MATH_REGS 240
+#endif
+#ifndef DSA_SPEC_REGS
+#define DSA_SPEC_REGS 24
+#endif
+#ifndef DSA_TMEM_ROWS
+// Rows retired per tcgen05.ld. 2 is 32dp32b64x; 4 (32dp32b128x) pulls the whole
+// BLOCK_Q accumulator in one load, halving the loads and fences. 4 releases
+// TMEM one step earlier at the cost of holding 128 accumulator registers
+// instead of 64 -- that used to spill 8 bytes, which is why it was rejected
+// once; raising the math warps to 240 registers (DSA_MATH_REGS, paid for by
+// dropping the specialized warps to the setmaxnreg minimum of 24) absorbs it.
+// The budget is zero-sum and exactly saturated: 8*32*240 + 4*32*24 = 64,512 =
+// the 168*384 pool ptxas allocates under launch_bounds(384,1).
+#define DSA_TMEM_ROWS 4
+#endif
+#ifndef DSA_UMMA_STAGES
+// Accumulator buffers per math warp group; see kNumUmmaStages below.
+// 2 (TMEM double buffer) measured -2.7% at 256K.
+#define DSA_UMMA_STAGES 2
 #endif
 
 #define DSA_ST_CAND_VAL(dst, v) __stcs(&(dst), (v))
@@ -83,10 +116,6 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                          int32_t* __restrict__ cand_idx,       // [seq_len, cand_cap]
                          int32_t* __restrict__ cand_cnt,       // [seq_len]
                          const uint32_t cand_cap,
-                         const uint32_t repair,             // certificate-repair pass
-                         const int32_t* __restrict__ th_safe,     // exact fallback gate
-                         const int32_t* __restrict__ seed_total,  // seeds emitted (<= th_safe)
-                         const int32_t* __restrict__ seed_pred,   // seeds under the predicted gate
                          const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_kv_scales,
@@ -100,50 +129,10 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
     const auto lane_idx = ptx::get_lane_idx();
     constexpr uint32_t kSpecWarpStart = kNumMathWarpGroups * 4;
     constexpr uint32_t kNumMathWarps = kNumMathThreads / 32;
+    constexpr uint32_t kNumUmmaStages = DSA_UMMA_STAGES;
+    constexpr uint32_t kNumUmmaBuffers = kNumMathWarpGroups * kNumUmmaStages;
 
     DG_STATIC_ASSERT(kNumSpecializedThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
-
-    if (repair) {
-        // Certificate-repair pass. A row is CERTIFIED exact iff at least
-        // topk genuine elements were counted STRICTLY below the predicted
-        // gate (scan emissions + predicted-qualifying seeds) and nothing
-        // overflowed the buffer: then the true top-k is fully inside the
-        // candidate set. CTAs whose rows all certify exit before touching
-        // any barrier or TMEM. Failed rows fall back to the exact subset
-        // bound (th_safe, provably >= the true k-th, and provably yielding
-        // cnt >= topk on the re-scan) with their counters rolled back to
-        // the seed base. Caller runs this pass with refresh OFF so the
-        // re-emitted counts cannot double-tighten anything.
-        bool all_ok = true;
-        #pragma unroll
-        for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-            const uint32_t r = blockIdx.x * BLOCK_Q + i;
-            if (r >= seq_len) continue;
-            const int c = cand_cnt[r];
-            const bool ok = (c - seed_total[r] + seed_pred[r] >= static_cast<int>(topk))
-                            && (c <= static_cast<int>(cand_cap));
-            all_ok &= ok;
-        }
-        if (all_ok) return;
-        if (threadIdx.x == 0) {
-            #pragma unroll
-            for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-                const uint32_t r = blockIdx.x * BLOCK_Q + i;
-                if (r >= seq_len) continue;
-                const int c = cand_cnt[r];
-                const bool ok = (c - seed_total[r] + seed_pred[r] >= static_cast<int>(topk))
-                                && (c <= static_cast<int>(cand_cap));
-                if (ok) {
-                    th_bucket[r] = -(1 << 30);   // certified: gate emits nothing
-                } else {
-                    th_bucket[r] = th_safe[r];
-                    cand_cnt[r] = seed_total[r];
-                }
-            }
-            __threadfence();
-        }
-        __syncthreads();
-    }
 
     if (warp_idx == kSpecWarpStart) {
         cute::prefetch_tma_descriptor(&tensor_map_q);
@@ -163,7 +152,7 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
     DG_STATIC_ASSERT(SMEM_WEIGHT_SIZE_PER_STAGE % 512 == 0, "Unaligned TMA swizzling");
     DG_STATIC_ASSERT(SMEM_KV_SIZE_PER_STAGE % 512 == 0, "Unaligned TMA swizzling");
 
-    constexpr uint32_t kNumTmemCols = BLOCK_Q * kNumHeads * kNumMathWarpGroups;
+    constexpr uint32_t kNumTmemCols = BLOCK_Q * kNumHeads * kNumUmmaBuffers;
     DG_STATIC_ASSERT(kNumTmemCols <= 512, "Too many tensor memory");
 
     auto smem_q = utils::PatternVisitor([&](const uint32_t& i) {
@@ -189,9 +178,9 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
     auto full_kv_barriers    = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + i); });
     auto empty_kv_barriers   = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + kNumKVStages + i); });
     auto full_umma_barriers  = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + kNumKVStages * 2 + i); });
-    auto empty_umma_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + kNumKVStages * 2 + kNumMathWarpGroups + i); });
+    auto empty_umma_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + kNumKVStages * 2 + kNumUmmaBuffers + i); });
 
-    auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_ptr + kNumQStages * 2 + kNumKVStages * 2 + kNumMathWarpGroups * 2);
+    auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_ptr + kNumQStages * 2 + kNumKVStages * 2 + kNumUmmaBuffers * 2);
     auto scan_done_flag = reinterpret_cast<volatile int*>(tmem_ptr_in_smem + 1);
     auto kv_progress_ptr = reinterpret_cast<volatile int*>(tmem_ptr_in_smem + 2);
 #ifdef DSA_PERSIST
@@ -212,8 +201,7 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
     // unchanged; a racing read can only UNDERcount -> looser gate -> safe.
     auto smem_hist = reinterpret_cast<int32_t*>(warpq_idx + kNumMathWarps * BLOCK_Q * DSA_WARP_QUEUE_CAP);
 #ifdef DSA_HIST_DEFER
-#if defined(DSA_BULK_DRAIN) || defined(DSA_LANE_EMIT) || defined(DSA_DIRECT_EMIT) \
-    || defined(DSA_QUEUE_NULL) || defined(DSA_EMIT_NULL) || defined(DSA_PERSIST)
+#if defined(DSA_EMIT_NULL) || defined(DSA_PERSIST)
 #error "DSA_HIST_DEFER: only the default queue/drain path is instrumented"
 #endif
     // Deferred-feed watermark: per row-local slot, the count of candidates
@@ -248,7 +236,7 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
     if (warp_idx == kSpecWarpStart + 1) {
         if (cute::elect_one_sync()) {
             #pragma unroll
-            for (uint32_t i = 0; i < kNumMathWarpGroups; ++ i) {
+            for (uint32_t i = 0; i < kNumUmmaBuffers; ++ i) {
                 full_umma_barriers[i]->init(1);
                 empty_umma_barriers[i]->init(128);
             }
@@ -267,18 +255,8 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
     }
     __syncthreads();
 
-#ifdef DSA_REGS_240
-    // A/B round 2: 240/32 (= exactly 65536, zero slack) DEADLOCKED at boot --
-    // the setmaxnreg redistribution cannot be satisfied at 100% file
-    // utilization. 240/24 keeps the current total (64512, 1024 slack);
-    // the specialized paths (TMA/governor/daemon) get squeezed 40->24 and
-    // may spill -- realshape + bench arbitrate.
-    constexpr uint32_t kNumSpecializedRegisters = 24;
-    constexpr uint32_t kNumMathRegisters = 240;
-#else
-    constexpr uint32_t kNumSpecializedRegisters = 40;
-    constexpr uint32_t kNumMathRegisters = 232;
-#endif
+    constexpr uint32_t kNumSpecializedRegisters = DSA_SPEC_REGS;
+    constexpr uint32_t kNumMathRegisters = DSA_MATH_REGS;
 
     // V1 KV-split scheduling: blockIdx.x = q-block (one per CTA), blockIdx.y =
     // contiguous KV sub-window. Split boundaries are BLOCK_KV-aligned.
@@ -395,9 +373,15 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
 
                 DG_STATIC_ASSERT(BLOCK_KV == kNumMathThreads, "Invalid block size");
                 DG_STATIC_ASSERT(kHeadDim % UMMA_K == 0, "Invalid head dim");
+                // Round-robin over kNumUmmaStages accumulators. A stage is
+                // reused every kNumUmmaStages tiles, so its phase toggles at
+                // that rate, not every tile.
+                const uint32_t umma_stage = kvg % kNumUmmaStages;
+                const uint32_t umma_phase = (kvg / kNumUmmaStages) & 1;
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumMathWarpGroups; ++ i) {
-                    empty_umma_barriers[i]->wait((kvg & 1) ^ 1);
+                    const uint32_t buf = i * kNumUmmaStages + umma_stage;
+                    empty_umma_barriers[buf]->wait(umma_phase ^ 1);
                     ptx::tcgen05_after_thread_sync();
                     #pragma unroll
                     for (uint32_t k = 0; k < kHeadDim / UMMA_K; ++ k) {
@@ -405,9 +389,9 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                             smem_kv[kv_stage_idx], i * UMMA_M, k * UMMA_K);
                         auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim, kHeadDim>(
                             smem_q[0], 0, k * UMMA_K);
-                        cute::SM100_MMA_F8F6F4_SS::fma(a_desc, b_desc, i * UMMA_N, k, runtime_instr_desc);
+                        cute::SM100_MMA_F8F6F4_SS::fma(a_desc, b_desc, buf * UMMA_N, k, runtime_instr_desc);
                     }
-                    cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(full_umma_barriers[i]));
+                    cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(full_umma_barriers[buf]));
                 }
             }
             empty_q_barriers[0]->arrive();
@@ -551,37 +535,27 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
     } else if (warp_idx < kSpecWarpStart) {
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
-        const auto tmem_start = warpgroup_idx * UMMA_N;
         const auto math_thread_idx = warp_idx * 32 + lane_idx;
 
         auto tmem_load = [](auto num_elems_c, const uint32_t& tmem_addr, float* accum) {
             constexpr int N = decltype(num_elems_c)::value;
-            DG_STATIC_ASSERT(N == 32 or N == 64, "Unsupported TMEM load size");
+            DG_STATIC_ASSERT(N == 32 or N == 64 or N == 128, "Unsupported TMEM load size");
             using Loader = cute::conditional_t<N == 32,
                 cute::SM100_TMEM_LOAD_32dp32b32x,
-                cute::SM100_TMEM_LOAD_32dp32b64x>;
+                cute::conditional_t<N == 64,
+                    cute::SM100_TMEM_LOAD_32dp32b64x,
+                    cute::SM100_TMEM_LOAD_32dp32b128x>>;
             [&]<size_t... Is>(cute::index_sequence<Is...>) {
                 Loader::copy(tmem_addr, reinterpret_cast<uint32_t*>(accum)[Is]...);
             }(cute::make_index_sequence<N>{});
             cutlass::arch::fence_view_async_tmem_load();
         };
 
-#if defined(DSA_BUCKET_GATE) && (defined(DSA_OLD_GATE) || defined(DSA_LANE_EMIT) \
-    || defined(DSA_DIRECT_EMIT) || defined(DSA_QUEUE_NULL))
-#error "DSA_BUCKET_GATE repurposes inv_reg/vth_reg; incompatible with these variants"
-#endif
-#if defined(DSA_BUCKET_GATE2) && (defined(DSA_BUCKET_GATE) || defined(DSA_OLD_GATE) \
-    || defined(DSA_LANE_EMIT) || defined(DSA_DIRECT_EMIT) || defined(DSA_QUEUE_NULL))
+#if defined(DSA_BUCKET_GATE2) && defined(DSA_BUCKET_GATE)
 #error "DSA_BUCKET_GATE2: incompatible variant combination"
 #endif
-#if defined(DSA_BUCKET_GATE3) && (defined(DSA_BUCKET_GATE) || defined(DSA_BUCKET_GATE2) \
-    || defined(DSA_OLD_GATE) || defined(DSA_LANE_EMIT) || defined(DSA_DIRECT_EMIT) \
-    || defined(DSA_QUEUE_NULL) || defined(DSA_PERSIST))
-#error "DSA_BUCKET_GATE3: incompatible variant combination"
-#endif
 #if defined(DSA_BUCKET_GATE4) && (defined(DSA_BUCKET_GATE) || defined(DSA_BUCKET_GATE2) \
-    || defined(DSA_BUCKET_GATE3) || defined(DSA_OLD_GATE) || defined(DSA_LANE_EMIT) \
-    || defined(DSA_DIRECT_EMIT) || defined(DSA_QUEUE_NULL) || defined(DSA_PERSIST))
+    || defined(DSA_PERSIST))
 #error "DSA_BUCKET_GATE4: incompatible variant combination"
 #endif
         // NOTE (DSA_BIT_GATE, tried + REJECTED 2026-07-11): ALU bit-pattern
@@ -631,17 +605,11 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
             // registers + branch alone spill at the 168-reg cap. The queue +
             // register-count path below is the measured optimum for emit.
             int qn_reg[BLOCK_Q];
-#ifdef DSA_LANE_EMIT
-            uint32_t lcnt = 0;  // 4x8-bit per-row private-slot counters
-#endif
-#if defined(DSA_EMIT_NULL) || defined(DSA_QUEUE_NULL)
+#ifdef DSA_EMIT_NULL
             uint32_t emit_sink = 0;  // keeps the gate live without emit code
 #endif
 #ifdef DSA_GATE_NULL
             float gate_sink = 0.f;   // keeps scoring live without the gate
-#endif
-#if defined(DSA_BULK_DRAIN) && defined(DSA_BULK_PP)
-            int dr_reg[BLOCK_Q] = {};  // ring drained cursor (multiple of 32)
 #endif
             #pragma unroll
             for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
@@ -661,16 +629,6 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                 // vth_reg repurposed to -o*inv.
                 vth_reg[i] = -o_reg[i] * inv_reg[i];
 #endif
-#ifdef DSA_BUCKET_GATE3
-                // fully-folded bucket space: the FFMA2 chain runs in bucket
-                // units (w' = -inv*w, folded below), the tail is
-                // fmaf(scale_kv, sum', c0) -- ONE F2I over the sign gate.
-                // Slot repurposing (zero new registers): vth_reg = c0 =
-                // -o*inv; o_reg = delta = 1/inv (exact hit-side x
-                // reconstruction: x = (bq - c0) * delta).
-                vth_reg[i] = -o_reg[i] * inv_reg[i];
-                o_reg[i] = 1.0f / inv_reg[i];
-#endif
 #ifdef DSA_BUCKET_GATE4
                 // GATE4 (user's final form): bucket-space FLOAT end to end.
                 // bq = fmaf(scale_kv, sum', c0) -- form-identical to the sign
@@ -689,7 +647,7 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                 kstart_reg[i] = seq_k_start[i];
                 kspan_reg[i] = seq_k_end[i] > seq_k_start[i] ? seq_k_end[i] - seq_k_start[i] : 0;
             }
-#if defined(DSA_BUCKET_GATE3) || defined(DSA_BUCKET_GATE4)
+#ifdef DSA_BUCKET_GATE4
             // Fold -inv into the register weights: the whole ReLU-weighted
             // chain then accumulates directly in bucket units. 128 FMULs
             // once per qb, amortized over thousands of kv blocks.
@@ -721,44 +679,6 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
             #pragma unroll
             for (uint32_t i = 0; i < BLOCK_Q; ++ i)
                 th_pf[i] = __ldcg(th_bucket + min(block_q_idx * BLOCK_Q + i, seq_len - 1));
-#ifdef DSA_LANE_EMIT
-            // GVR-style ballot-free collection: hits stage into per-lane
-            // private smem slots (2 per lane-row, reusing the warpq extent);
-            // every GATE_STRIDE window the lanes drain STRAIGHT TO GLOBAL
-            // via one redux + shfl-prefix + one atomic per row (amortized
-            // 1/16 blocks). Hot path per hit: extract counter + 2 STS +
-            // counter bump -- no ballot, no popc, no shfl, no syncwarp.
-            const auto drain_lanes = [&]() {
-                #pragma unroll
-                for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-                    const uint32_t c = (lcnt >> (i * 8)) & 0xffu;
-                    const uint32_t tot = __reduce_add_sync(FULL, c);
-                    if (tot == 0) continue;
-                    uint32_t off = c;
-                    #pragma unroll
-                    for (uint32_t d = 1; d < 32; d <<= 1) {
-                        const uint32_t nsh = __shfl_up_sync(FULL, off, d);
-                        if (lane_idx >= d) off += nsh;
-                    }
-                    off -= c;  // exclusive prefix
-                    const uint32_t row_q = block_q_idx * BLOCK_Q + i;
-                    int base = 0;
-                    if (lane_idx == 0) base = atomicAdd(cand_cnt + row_q, (int)tot);
-                    base = __shfl_sync(FULL, base, 0);
-                    const uint32_t qb = (warp_idx * BLOCK_Q + i) * DSA_WARP_QUEUE_CAP;
-                    const uint64_t ob = static_cast<uint64_t>(row_q) * cand_cap;
-                    for (uint32_t s = 0; s < c; ++ s) {
-                        const int w = base + (int)(off + s);
-                        if (w < static_cast<int>(cand_cap)) {
-                            const uint32_t sl = qb + lane_idx * 2u + s;
-                            DSA_ST_CAND_VAL(cand_val[ob + w], warpq_val[sl]);
-                            DSA_ST_CAND_IDX(cand_idx[ob + w], warpq_idx[sl]);
-                        }
-                    }
-                }
-                lcnt = 0;
-            };
-#endif
 
             // Drain a (warp,row) queue segment to the global candidate
             // buffer. The probe index mapping lives HERE, not on the insert
@@ -766,44 +686,7 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
             // instructions dragged by a single hit); at drain time 32 lanes
             // retire DSA_WARP_QUEUE_CAP entries in parallel, so it costs
             // ~1/30th in issue slots and is semantically identical.
-#if !defined(DSA_EMIT_NULL) && !defined(DSA_QUEUE_NULL)
-#ifdef DSA_BULK_DRAIN
-            // Bulk drain: qn is a multiple of 4 (caller-guaranteed), base is
-            // 4-aligned by induction (seed counts are padded to 4; every
-            // drain adds a multiple of 4) -> both TMA addresses are 16B-
-            // aligned. Payload rides the TMA engine: ~5 issue slots replace
-            // the per-entry LDS/remap/STG chains (and their register/codegen
-            // tax on the whole hot loop). Index remap moved to select output.
-            const auto drain_queue = [&](const uint32_t i, const uint32_t row_q,
-                                         const uint32_t queue_base, const int qn,
-                                         const int base) {
-                const int avail = static_cast<int>(cand_cap) - base;
-                const int len = min(qn, max(avail, 0)) & ~3;
-                if (len > 0 && lane_idx == 0) {
-                    const uint64_t ob = static_cast<uint64_t>(row_q) * cand_cap
-                                        + static_cast<uint32_t>(base);
-                    const uint32_t sv = static_cast<uint32_t>(
-                        __cvta_generic_to_shared(warpq_val + queue_base));
-                    const uint32_t si = static_cast<uint32_t>(
-                        __cvta_generic_to_shared(warpq_idx + queue_base));
-                    asm volatile(
-                        "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;\n"
-                        :: "l"(cand_val + ob), "r"(sv), "r"(len * 4) : "memory");
-                    asm volatile(
-                        "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;\n"
-                        :: "l"(cand_idx + ob), "r"(si), "r"(len * 4) : "memory");
-                    asm volatile("cp.async.bulk.commit_group;\n");
-#ifndef DSA_BULK_PP
-                    // The queue slots are refilled right after: wait for the
-                    // TMA engine's smem READS (not the gmem writes) to finish.
-                    asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
-#endif
-                    // (ring mode: the wait moved to the NEXT drain of this
-                    // warp — by then the copy is ~32 candidates old.)
-                }
-                __syncwarp(FULL);
-            };
-#else
+#ifndef DSA_EMIT_NULL
             const auto drain_queue = [&](const uint32_t i, const uint32_t row_q,
                                          const uint32_t queue_base, const int qn,
                                          const int base) {
@@ -842,8 +725,7 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                 (void)out_base;  // timing-only: counts kept, payload skipped
 #endif
             };
-#endif
-#endif  // !EMIT_NULL && !QUEUE_NULL
+#endif  // !EMIT_NULL
 
             for (uint32_t kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++ kv_block_idx) {
 #ifdef DSA_PERSIST
@@ -855,9 +737,6 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                 full_kv_barriers[kv_stage_idx]->wait(kv_phase);
 
                 if ((kv_block_idx % DSA_GATE_STRIDE) == 0) {
-#ifdef DSA_LANE_EMIT
-                    if (kv_block_idx > 0) drain_lanes();
-#endif
                     #pragma unroll
                     for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
                         const int g = th_pf[i];
@@ -867,20 +746,15 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                             // edge = float(g+1): exact for small ints, no
                             // division. The gate compares BITS against it.
                             o_reg[i] = static_cast<float>(g + 1);
-#elif defined(DSA_BUCKET_GATE) || defined(DSA_BUCKET_GATE2) || defined(DSA_BUCKET_GATE3)
+#elif defined(DSA_BUCKET_GATE) || defined(DSA_BUCKET_GATE2)
                             // bucket gate compares braw <= gate_reg directly:
                             // nothing to precompute (no edge float, no div).
-#elif !defined(DSA_OLD_GATE)
+#else
                             // SIGN GATE (default): stores +th_x; the hot path computes
                             // t = fmaf(scale, sums, th_x) = v - C and tests the
                             // SIGN BIT (ISETP on the INT pipe); the FSETP and
                             // the final FMUL are algebraically absorbed.
                             vth_reg[i] = o_reg[i] + static_cast<float>(g + 1) / inv_reg[i];
-#else
-                            // Stored NEGATED: emit <=> x < vth <=> v > -vth. IEEE
-                            // negation is exact, so the gate decision is unchanged
-                            // while the hot path drops one FNEG per row per block.
-                            vth_reg[i] = -(o_reg[i] + static_cast<float>(g + 1) / inv_reg[i]);
 #endif
                         }
                     }
@@ -891,7 +765,9 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
 
                 float scale_kv = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + math_thread_idx);
 
-                full_umma_barriers[warpgroup_idx]->wait(kvg & 1);
+                const uint32_t umma_buf = warpgroup_idx * kNumUmmaStages + (kvg % kNumUmmaStages);
+                const auto tmem_start = umma_buf * UMMA_N;
+                full_umma_barriers[umma_buf]->wait((kvg / kNumUmmaStages) & 1);
                 ptx::tcgen05_after_thread_sync();
 
                 empty_kv_barriers[kv_stage_idx]->arrive();
@@ -912,7 +788,8 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                 // block picks a loop body WITHOUT the per-element range
                 // checks (SASS: saves 4x VIADD + 4x ISETP per column) for the
                 // >99% of blocks fully inside every row's [ks, ke).
-                DG_STATIC_ASSERT(BLOCK_Q % 2 == 0, "row-pair loads need even BLOCK_Q");
+                DG_STATIC_ASSERT(BLOCK_Q % DSA_TMEM_ROWS == 0,
+                                 "BLOCK_Q must divide evenly into TMEM load groups");
 #if defined(DSA_GATE_NULL)
                 #define DSA_SCORE_GATE(i, RC)                                                  \
                         const float v = scale_kv * (sum.x + sum.y);                            \
@@ -927,19 +804,6 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                         const float bq = fmaf(scale_kv, sum.x + sum.y, vth_reg[i]);            \
                         v_row[i] = bq;                                                         \
                         bool g = __float_as_int(bq) < __float_as_int(o_reg[i]);                \
-                        if constexpr (RC)                                                      \
-                            g = g and ((kv_offset - kstart_reg[i]) < kspan_reg[i]);            \
-                        pass_bits |= g ? (1u << i) : 0u;
-#elif defined(DSA_BUCKET_GATE3)
-                // Fully-folded bucket gate: the chain summed w'*ReLU (bucket
-                // units), so the tail FFMA is form-identical to the sign
-                // gate's; the ONLY extra column cost is the F2I. Hits reuse
-                // v_row (bucket float) for both feed (1 F2I) and exact x
-                // reconstruction ((bq - c0) * delta).
-                #define DSA_SCORE_GATE(i, RC)                                                  \
-                        const float bq = fmaf(scale_kv, sum.x + sum.y, vth_reg[i]);            \
-                        v_row[i] = bq;                                                         \
-                        bool g = static_cast<int>(bq) <= gate_reg[i];                          \
                         if constexpr (RC)                                                      \
                             g = g and ((kv_offset - kstart_reg[i]) < kspan_reg[i]);            \
                         pass_bits |= g ? (1u << i) : 0u;
@@ -979,7 +843,7 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                         if constexpr (RC)                                                      \
                             g = g and ((kv_offset - kstart_reg[i]) < kspan_reg[i]);            \
                         pass_bits |= g ? (1u << i) : 0u;
-#elif !defined(DSA_OLD_GATE)
+#else
                 // t = v - C in one FFMA; hit <=> sign bit clear. +0/NaN admit
                 // (loose-safe; the old FSETP DROPPED NaN scores). True x is
                 // reconstructed only on the hit path: x = th_x - t.
@@ -990,29 +854,22 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                         if constexpr (RC)                                                      \
                             g = g and ((kv_offset - kstart_reg[i]) < kspan_reg[i]);            \
                         pass_bits |= g ? (1u << i) : 0u;
-#else
-                #define DSA_SCORE_GATE(i, RC)                                                  \
-                        const float v = scale_kv * (sum.x + sum.y);                            \
-                        v_row[i] = v;                                                          \
-                        bool g = v > vth_reg[i];                                               \
-                        if constexpr (RC)                                                      \
-                            g = g and ((kv_offset - kstart_reg[i]) < kspan_reg[i]);            \
-                        pass_bits |= g ? (1u << i) : 0u;
 #endif
                 const uint32_t kv_base = kv_start + kv_block_idx * BLOCK_KV;
                 const bool interior = (kv_base >= rs_max) && (kv_base + BLOCK_KV <= re_min);
                 #define DSA_SCORE_ROWS(RANGE_CHECK)                                            \
                 _Pragma("unroll")                                                              \
-                for (uint32_t pr = 0; pr < BLOCK_Q / 2; ++ pr) {                               \
-                    float accum2[kNumHeads * 2];                                               \
-                    tmem_load(cute::Int<kNumHeads * 2>{}, tmem_start + pr * 2 * kNumHeads, accum2); \
-                    if (pr == BLOCK_Q / 2 - 1) {                                               \
+                for (uint32_t pr = 0; pr < BLOCK_Q / DSA_TMEM_ROWS; ++ pr) {                   \
+                    float accum2[kNumHeads * DSA_TMEM_ROWS];                                   \
+                    tmem_load(cute::Int<kNumHeads * DSA_TMEM_ROWS>{},                          \
+                              tmem_start + pr * DSA_TMEM_ROWS * kNumHeads, accum2);            \
+                    if (pr == BLOCK_Q / DSA_TMEM_ROWS - 1) {                                   \
                         ptx::tcgen05_before_thread_sync();                                     \
-                        empty_umma_barriers[warpgroup_idx]->arrive();                          \
+                        empty_umma_barriers[umma_buf]->arrive();                               \
                     }                                                                          \
                     _Pragma("unroll")                                                          \
-                    for (uint32_t k = 0; k < 2; ++ k) {                                        \
-                        const uint32_t i = pr * 2 + k;                                         \
+                    for (uint32_t k = 0; k < DSA_TMEM_ROWS; ++ k) {                            \
+                        const uint32_t i = pr * DSA_TMEM_ROWS + k;                             \
                         const float* accum = accum2 + k * kNumHeads;                           \
                         auto sum_0 = make_float2(0, 0);                                        \
                         auto sum_1 = make_float2(0, 0);                                        \
@@ -1046,93 +903,6 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                 // Branches are warp-uniform (no divergence around collectives).
 #ifdef DSA_EMIT_NULL
                 emit_sink += pass_bits;      // gate + vote priced, zero emit
-#elif defined(DSA_DIRECT_EMIT)
-                // Direct per-hit emission: no queue, no ballot, no drain.
-                // Wager: at enriched-bound densities (~0.3 hits per
-                // warp-block) the returning atomic's frequency x cost drops
-                // below the queue machinery's standing cost. RAW indices
-                // (select-side remap).
-                if (pass_bits) {
-                    #pragma unroll
-                    for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-                        if ((pass_bits >> i) & 1u) {
-                            const float x = vth_reg[i] - v_row[i];
-                            const uint32_t row_q = block_q_idx * BLOCK_Q + i;
-                            const int w = atomicAdd(cand_cnt + row_q, 1);
-                            if (w < static_cast<int>(cand_cap)) {
-                                const uint64_t ob = static_cast<uint64_t>(row_q) * cand_cap;
-                                DSA_ST_CAND_VAL(cand_val[ob + w], x);
-                                DSA_ST_CAND_IDX(cand_idx[ob + w], static_cast<int32_t>(kv_offset));
-                            }
-                            if (refresh_every > 0) {
-                                int braw = static_cast<int>((x - o_reg[i]) * inv_reg[i]);
-                                int b = braw < 0 ? 0 : (braw > static_cast<int>(num_buckets) - 1 ? static_cast<int>(num_buckets) - 1 : braw);
-                                if (hist_in_smem) {
-                                    atomicAdd(smem_hist + i * num_buckets + b, 1);
-                                } else {
-                                    atomicAdd(&bcount[static_cast<uint64_t>(row_q) * num_buckets + b], 1);
-                                }
-                            }
-                        }
-                    }
-                }
-#elif defined(DSA_LANE_EMIT)
-                // per-lane, zero collectives: extract counter, 2 STS, bump.
-                // Overflow past the 2 private slots (rare at any density
-                // between drains) falls through to a direct global append.
-                if (pass_bits) {
-                    #pragma unroll
-                    for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-                        if ((pass_bits >> i) & 1u) {
-                            const float x = vth_reg[i] - v_row[i];
-                            const uint32_t c = (lcnt >> (i * 8)) & 0xffu;
-                            const uint32_t row_q = block_q_idx * BLOCK_Q + i;
-                            if (c < 2u) {
-                                const uint32_t sl = (warp_idx * BLOCK_Q + i) * DSA_WARP_QUEUE_CAP
-                                                    + lane_idx * 2u + c;
-                                warpq_val[sl] = x;
-                                warpq_idx[sl] = static_cast<int32_t>(kv_offset);
-                                lcnt += (1u << (i * 8));
-                            } else {
-                                const int w = atomicAdd(cand_cnt + row_q, 1);
-                                if (w < static_cast<int>(cand_cap)) {
-                                    const uint64_t ob = static_cast<uint64_t>(row_q) * cand_cap;
-                                    DSA_ST_CAND_VAL(cand_val[ob + w], x);
-                                    DSA_ST_CAND_IDX(cand_idx[ob + w], static_cast<int32_t>(kv_offset));
-                                }
-                            }
-                            if (refresh_every > 0) {
-                                int braw = static_cast<int>((x - o_reg[i]) * inv_reg[i]);
-                                int b = braw < 0 ? 0 : (braw > static_cast<int>(num_buckets) - 1 ? static_cast<int>(num_buckets) - 1 : braw);
-                                if (hist_in_smem) {
-                                    atomicAdd(smem_hist + i * num_buckets + b, 1);
-                                } else {
-                                    atomicAdd(&bcount[static_cast<uint64_t>(row_q) * num_buckets + b], 1);
-                                }
-                            }
-                        }
-                    }
-                }
-#elif defined(DSA_QUEUE_NULL)
-                // gate + histogram/refresh priced; queue/drain/writeback gone
-                if (__any_sync(FULL, pass_bits)) {
-                    #pragma unroll
-                    for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-                        if ((pass_bits >> i) & 1u) {
-#ifndef DSA_OLD_GATE
-                            const float x = vth_reg[i] - v_row[i];
-#else
-                            const float x = -v_row[i];
-#endif
-                            int braw = static_cast<int>((x - o_reg[i]) * inv_reg[i]);
-                            int b = braw < 0 ? 0 : (braw > static_cast<int>(num_buckets) - 1 ? static_cast<int>(num_buckets) - 1 : braw);
-                            if (refresh_every > 0) {
-                                if (hist_in_smem) atomicAdd(smem_hist + i * num_buckets + b, 1);
-                                else atomicAdd(&bcount[static_cast<uint64_t>(block_q_idx * BLOCK_Q + i) * num_buckets + b], 1);
-                            } else emit_sink += static_cast<uint32_t>(b);
-                        }
-                    }
-                }
 #else
                 if (__any_sync(FULL, pass_bits)) {
                     const uint32_t rows_union = __reduce_or_sync(FULL, pass_bits);
@@ -1156,39 +926,13 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                             const int cnt = __popc(m);
                             const uint32_t queue_base = (warp_idx * BLOCK_Q + i) * DSA_WARP_QUEUE_CAP;
                             int qn = qn_reg[i];
-#if defined(DSA_BULK_DRAIN) && defined(DSA_BULK_PP)
-                            if (false) {  // ring drains POST-insert (see below)
-#else
                             if (qn + cnt > static_cast<int>(DSA_WARP_QUEUE_CAP)) {
-#endif
-#if defined(DSA_BULK_DRAIN) && defined(DSA_BULK_PP)
-                                // unreachable: ring drains post-insert
-#elif defined(DSA_BULK_DRAIN)
-                                // drain in 4-entry granularity (16B TMA
-                                // alignment); the 0-3 leftover entries slide
-                                // to the queue front and roll onward.
-                                const int qn4 = qn & ~3;
-                                if (qn4 > 0) {
-                                    int base = 0;
-                                    if (lane_idx == 0) base = atomicAdd(cand_cnt + row_q, qn4);
-                                    base = __shfl_sync(FULL, base, 0);
-                                    drain_queue(i, row_q, queue_base, qn4, base);
-                                }
-                                const int rem = qn - qn4;
-                                if (static_cast<int>(lane_idx) < rem) {
-                                    warpq_val[queue_base + lane_idx] = warpq_val[queue_base + qn4 + lane_idx];
-                                    warpq_idx[queue_base + lane_idx] = warpq_idx[queue_base + qn4 + lane_idx];
-                                }
-                                qn = rem;
-                                __syncwarp(FULL);  // queue slots reusable
-#else
                                 int base = 0;
                                 if (lane_idx == 0) base = atomicAdd(cand_cnt + row_q, qn);
                                 base = __shfl_sync(FULL, base, 0);
                                 drain_queue(i, row_q, queue_base, qn, base);
                                 qn = 0;
                                 __syncwarp(FULL);  // queue slots reusable
-#endif
                             }
                             if (g) {
                                 // Lean insert: position + two STS; the probe
@@ -1200,29 +944,19 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                                 // (measured +0.2..0.9ms @q8192 production).
 #if defined(DSA_BUCKET_GATE4)
                                 const float x = v_row[i];   // bucket-space value IS the payload
-#elif defined(DSA_BUCKET_GATE3)
-                                // exact x from the bucket float: (bq - c0) * delta
-                                const float x = (v_row[i] - vth_reg[i]) * o_reg[i];
 #elif defined(DSA_BUCKET_GATE2)
                                 const float x = v_row[i];   // v_row holds x directly
 #elif defined(DSA_BUCKET_GATE)
                                 const float x = -v_row[i];  // v is the raw scaled score here
-#elif !defined(DSA_OLD_GATE)
-                                const float x = vth_reg[i] - v_row[i];  // x = -v = th_x - t
 #else
-                                const float x = -v_row[i];
+                                const float x = vth_reg[i] - v_row[i];  // x = -v = th_x - t
 #endif
                                 const unsigned below = (1u << lane_idx) - 1u;
                                 const int pos = qn + __popc(m & below);
-#if defined(DSA_BULK_DRAIN) && defined(DSA_BULK_PP)
-                                warpq_val[queue_base + (pos & 63)] = x;
-                                warpq_idx[queue_base + (pos & 63)] = static_cast<int32_t>(kv_offset);
-#else
                                 warpq_val[queue_base + pos] = x;
                                 warpq_idx[queue_base + pos] = static_cast<int32_t>(kv_offset);
-#endif
                                 if (refresh_every > 0) {
-#if defined(DSA_BUCKET_GATE3) || defined(DSA_BUCKET_GATE4)
+#if defined(DSA_BUCKET_GATE4)
                                     // one F2I off the stored bucket float --
                                     // bucket-identical to the gate.
                                     int braw = static_cast<int>(v_row[i]);
@@ -1250,27 +984,6 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                                 }
                             }
                             qn_reg[i] = qn + cnt;
-#if defined(DSA_BULK_DRAIN) && defined(DSA_BULK_PP)
-                            // ring-64 post-insert drain (logical 2x32 ping-
-                            // pong): inserts only ever write the half NOT in
-                            // flight (lag <= 31 pre-insert, cnt <= 32, so
-                            // writes stay within [dr, dr+63]); once a full
-                            // 32-half is written, wait for the PREVIOUS
-                            // copy's smem reads (issued one half-life ago,
-                            // amortized-free) and ship this half. Fixed
-                            // 32-entry drains: no remainder, no slide,
-                            // 16B-aligned by construction.
-                            if (qn_reg[i] - dr_reg[i] >= 32) {
-                                if (lane_idx == 0)
-                                    asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
-                                __syncwarp(FULL);
-                                int base = 0;
-                                if (lane_idx == 0) base = atomicAdd(cand_cnt + row_q, 32);
-                                base = __shfl_sync(FULL, base, 0);
-                                drain_queue(i, row_q, queue_base + (dr_reg[i] & 63), 32, base);
-                                dr_reg[i] += 32;
-                            }
-#endif
                         }
                     }
                 }
@@ -1280,64 +993,27 @@ void sm100_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                     __threadfence_block();
                     *kv_progress_ptr = static_cast<int>(kvg + 1);
                 }
-#if defined(DSA_EMIT_NULL) || defined(DSA_QUEUE_NULL)
+#ifdef DSA_EMIT_NULL
                 if (emit_sink == 0x13371337u) *scan_done_flag = 2;  // unprovable sink
 #endif
             }
 
-#if !defined(DSA_EMIT_NULL) && !defined(DSA_QUEUE_NULL)
-#ifdef DSA_LANE_EMIT
-            drain_lanes();
-#endif
+#ifndef DSA_EMIT_NULL
             // Flush this CTA's warp queues (counts live in qn_reg).
-#ifdef DSA_BULK_DRAIN
-            // Arbitrary-length flushes break the 4-alignment other drains
-            // rely on. Intra-CTA: all math warps finish draining first
-            // (barrier). Inter-CTA (num_kv_splits > 1, small-Q only, never
-            // certificate mode): pad each flush to a multiple of 4 with
-            // +INF sentinels — select skips them via isfinite().
-            cutlass::arch::NamedBarrier(kNumMathThreads, 1).sync();
-#endif
             #pragma unroll
             for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
                 const uint32_t row_q = block_q_idx * BLOCK_Q + i;
                 const int qn = qn_reg[i];
                 if (row_q < seq_len && qn > 0) {
                     const uint32_t queue_base = (warp_idx * BLOCK_Q + i) * DSA_WARP_QUEUE_CAP;
-#ifdef DSA_BULK_DRAIN
-#ifdef DSA_BULK_PP
-                    const int fl = qn - dr_reg[i];       // undrained ring tail
-                    const int dr0 = dr_reg[i];
-#else
-                    const int fl = qn;
-                    const int dr0 = 0;
-#endif
-                    const int qn_add = (num_kv_splits > 1) ? ((fl + 3) & ~3) : fl;
-                    int base = 0;
-                    if (lane_idx == 0) base = atomicAdd(cand_cnt + row_q, qn_add);
-                    base = __shfl_sync(FULL, base, 0);
-                    // scalar stores, RAW indices (select-side remap covers
-                    // slots >= seed base)
-                    const uint64_t out_base = static_cast<uint64_t>(row_q) * cand_cap;
-                    for (int t = static_cast<int>(lane_idx); t < qn_add; t += 32) {
-                        const int w = base + t;
-                        if (w < static_cast<int>(cand_cap)) {
-                            DSA_ST_CAND_VAL(cand_val[out_base + w],
-                                            t < fl ? warpq_val[queue_base + ((dr0 + t) & 63)] : INFINITY);
-                            DSA_ST_CAND_IDX(cand_idx[out_base + w],
-                                            t < fl ? warpq_idx[queue_base + ((dr0 + t) & 63)] : 0);
-                        }
-                    }
-#else
                     int base = 0;
                     if (lane_idx == 0) base = atomicAdd(cand_cnt + row_q, qn);
                     base = __shfl_sync(FULL, base, 0);
                     drain_queue(i, row_q, queue_base, qn, base);
-#endif
                 }
             }
 
-#endif  // !EMIT_NULL && !QUEUE_NULL
+#endif  // !EMIT_NULL
 #ifdef DSA_PERSIST
             // per-qb epilogue: all math warps done -> signal daemon (final
             // refresh + hist zero + ack), release the q stage, next block.
