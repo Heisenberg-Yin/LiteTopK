@@ -1,4 +1,4 @@
-# litedsa — standalone tvm_ffi port (2026-07-24)
+# litedsa
 
 Grouped (packed) sparse prefill attention for DSA models on SM100: G=16
 adjacent queries' heads are packed into one 128-row attention call over the
