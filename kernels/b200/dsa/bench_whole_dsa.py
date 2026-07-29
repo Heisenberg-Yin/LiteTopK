@@ -1,42 +1,32 @@
 #!/usr/bin/env python3
-"""Standalone WHOLE-DSA latency bench on off-shelf caches (no 78L model load).
+"""Benchmark the DSA indexer and sparse MLA attention on recorded caches.
 
-Whole DSA = the fused indexer top-k + the sparse MLA attention that follows.
-Three methods on the SAME off-shelf chunk8192 cache (real GLM-5.2 layer-0
-indexer inputs + real topk_idx + real absorbed MLA q/kv):
+The script compares a dense indexer, LiteTopK followed by the standard sparse
+attention operator, and LiteTopK followed by LiteDSA grouped masked attention.
+All attention calls consume the cache's recorded top-k indices so the attention
+operators receive identical inputs. LiteDSA union construction is included in
+its timed call.
 
-  vLLM     : dense fp8 logits (deep_gemm) + top_k_per_row_prefill  ->  stock trtllm sparse MLA
-  LiteTopK : this repo's fused indexer (dsa_litetopk.cu, backported tuning) -> stock trtllm sparse MLA
-  LiteTopK+LiteDSA : same indexer -> litedsa grouped masked MLA (union over
-             G=16 adjacent queries' top-k, per-query membership mask)
-
-Everything here is self-contained to this repo: the indexer goes through
-`litetopk_indexer.try_chunk` (the same call `bench_q8192.py` times), and
-LiteDSA goes through `flashinfer_port/litedsa.so` directly (tvm_ffi), not
-through any external vLLM fork -- no dependency on vllm-lt-venv.
-
-Attention is fed the cache's REAL topk_idx for all three (isolates
-stock-vs-grouped on identical input). LiteDSA's union is rebuilt every call,
-so the per-call number includes the union build, matching a fresh chunk in
-deployment.
-
-Run in the glm5-prefill container, vLLM standard env (site-packages deep_gemm,
-flashinfer, tvm_ffi all present there already).
+Run in an environment containing vLLM, DeepGEMM, FlashInfer, and ``tvm_ffi``.
+Set ``DSA_CACHE_DIR`` to the cache directory and ``LITEDSA_SO`` to override the
+standalone LiteDSA module path.
 """
+import json
+import math
 import os
 import sys
 
 import torch
 
-sys.path.insert(0, os.environ.get("LITETOPK_MODULE_DIR", "/opt/litetopk_repro/glm5_prefill/litetopk_vllm"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_MODULE_DIR = os.path.abspath(
+    os.path.join(_HERE, "..", "..", "..", "glm5_prefill", "litetopk_vllm"))
+sys.path.insert(
+    0, os.environ.get("LITETOPK_MODULE_DIR", _DEFAULT_MODULE_DIR))
 os.environ.setdefault("VLLM_LITETOPK_MIN_S", "0")
-os.environ.setdefault("VLLM_LITETOPK_XFLAGS", "DSA_BUCKET_GATE4=1")
 os.environ.setdefault("VLLM_LITETOPK_PREP_TILE", "0")
 os.environ.setdefault("VLLM_LITETOPK_HOTONLY", "1")
 import litetopk_indexer  # noqa: E402
-
-import json
-import math
 
 import tvm_ffi  # noqa: E402
 from safetensors import safe_open  # noqa: E402
@@ -52,11 +42,11 @@ K, Q = 2048, 8192      # topk, prefill chunk
 G = 16                 # litedsa pack (TP8: n_rank_heads=8, 8*16=128)
 BLOCK_SIZE = 64         # MLA paged block size (FlashInferMLASparse default)
 TAGS = os.environ.get("TAGS", "768k 1m").split()
-DATA = "/data/dsa_caches/glm5_{}_realtext_chunk8192.safetensors"
+CACHE_DIR = os.environ.get("DSA_CACHE_DIR", "/data/dsa_caches")
 QK_NOPE, KV_LORA, QK_ROPE = 192, 512, 64
 
-_here = os.path.dirname(os.path.abspath(__file__))
-_litedsa_so = os.environ.get("LITEDSA_SO", os.path.join(_here, "flashinfer_port", "litedsa.so"))
+_litedsa_so = os.environ.get(
+    "LITEDSA_SO", os.path.join(_HERE, "flashinfer_port", "litedsa.so"))
 m = tvm_ffi.load_module(_litedsa_so)
 
 WORKSPACE = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=dev)
@@ -90,7 +80,9 @@ print(f"{'S':>6} {'idx(vLLM/LT)':>15} {'attn(stock/LD)':>16} "
 
 for tag in TAGS:
     T = {}
-    with safe_open(DATA.format(tag), "pt", device="cuda") as f:
+    cache_path = os.path.join(
+        CACHE_DIR, f"glm5_{tag}_realtext_chunk8192.safetensors")
+    with safe_open(cache_path, "pt", device="cuda") as f:
         meta = dict(f.metadata() or {})
         for k in f.keys():
             T[k] = f.get_tensor(k)
@@ -112,7 +104,7 @@ for tag in TAGS:
     ke = torch.full((Q,), S, dtype=torch.int32, device=dev)
     topk_ref = T["topk_idx"][:Q].contiguous().int()  # real reference top-k, for recall
 
-    # ---------- INDEXER: official dense (chunk=8192, its memory-unconstrained best) ----------
+    # ---------- INDEXER: dense reference ----------
     outo = torch.full((Q, K), -1, dtype=torch.int32, device=dev)
 
     def official():
@@ -123,7 +115,7 @@ for tag in TAGS:
     torch.cuda.synchronize()
     vllm_ms[tag] = round(evt(official, 5, 8), 3)
 
-    # ---------- INDEXER: this repo's fused LiteTopK (backported kernel), hot-started ----------
+    # ---------- INDEXER: LiteTopK with a carried-position sample ----------
     hot_key = f"whole_{tag}"
     litetopk_indexer.stash_carry(hot_key, outo, S)
     torch.cuda.synchronize()
@@ -139,7 +131,7 @@ for tag in TAGS:
     litetopk_ms[tag] = round(evt(fused_ind, 6, 8), 3)
     idx_recall[tag] = round(recall(outi, topk_ref), 2)
 
-    # ---------- ATTENTION setup (real absorbed MLA q/kv from the cache) ----------
+    # ---------- ATTENTION setup ----------
     mla_q = T["mla_q"].contiguous()                                # [8192, n_rank_heads, 576] fp8
     mla_kv = T["mla_kv"].contiguous()                              # [S, 576] fp8
     nblk = math.ceil(S / BLOCK_SIZE)
@@ -149,7 +141,7 @@ for tag in TAGS:
     blk_tbl = torch.arange(nblk, device=dev, dtype=torch.int32)[None, :]  # [1, nblk]
     req_id = torch.zeros(Q, dtype=torch.int32, device=dev)
 
-    # ---------- ATTENTION: stock trtllm sparse MLA, fed the real topk_idx ----------
+    # ---------- ATTENTION: standard sparse MLA ----------
     def stock_attn():
         phys, seq_lens = triton_convert_req_index_to_global_index(
             req_id, blk_tbl, topk_ref, BLOCK_SIZE=BLOCK_SIZE, NUM_TOPK_TOKENS=K,
@@ -166,7 +158,7 @@ for tag in TAGS:
     torch.cuda.synchronize()
     stock_ms[tag] = round(evt(stock_attn, 5, 8), 3)
 
-    # ---------- ATTENTION: LiteDSA grouped masked MLA (union rebuilt each call) ----------
+    # ---------- ATTENTION: LiteDSA grouped masked MLA ----------
     ng = Q // G
     cap = G * K  # constructive union bound, 128-aligned by construction (K=2048 -> cap=32768)
     u_phys = torch.empty(ng, cap, dtype=torch.int32, device=dev)

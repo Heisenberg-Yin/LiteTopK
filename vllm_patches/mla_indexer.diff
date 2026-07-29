@@ -8,7 +8,7 @@
 +            import os as _os
 +            # litetopk: decouple declared budget (init-time pool carve) from
 +            # runtime use -- lets a hybrid deployment reserve free headroom
-+            # for its own transients while the official path stays small.
++            # for extension transients while the dense path stays small.
 +            _rt = int(_os.environ.get("VLLM_LITETOPK_RUNTIME_LOGITS_MB", "0"))
 +            _mb = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB
 +            if _rt > 0:

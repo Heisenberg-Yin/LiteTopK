@@ -1,0 +1,100 @@
+--- vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
++++ vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
+@@ -12,6 +12,7 @@
+ - sparse_mla_top_k parameter must be set to the topk value
+ """
+ 
++import os
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, ClassVar
+ 
+@@ -51,6 +52,40 @@
+ 
+ FLASHINFER_MLA_SPARSE_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
+ 
++# ---- LiteDSA grouped sparse attention hook (VLLM_LITETOPK_LITEDSA=1) ------
++_LITEDSA_MOD = None
++_LITEDSA_OFF = os.environ.get("VLLM_LITETOPK_LITEDSA", "0") != "1"
++
++
++def _litedsa_try(q, kv_c_and_k_pe_cache, topk_indices, req_id_per_token,
++                 block_table, block_size, num_heads, bmm1_scale, bmm2_scale,
++                 group_size, version):
++    """Returns the attention output, or None if the hook is unavailable or
++    declines (caller falls through to the stock per-token path)."""
++    global _LITEDSA_MOD, _LITEDSA_OFF
++    if _LITEDSA_OFF:
++        return None
++    if _LITEDSA_MOD is None:
++        try:
++            import sys as _sys
++            _p = os.environ.get("LITETOPK_MODULE_DIR")
++            if _p and _p not in _sys.path:
++                _sys.path.insert(0, _p)
++            import litedsa_attn as _LITEDSA_MOD_  # noqa: N813
++            _LITEDSA_MOD = _LITEDSA_MOD_
++            logger.info("LiteDSA grouped-attention hook enabled")
++        except Exception as e:  # noqa: BLE001
++            logger.warning("LiteDSA hook import failed, disabled: %s", e)
++            _LITEDSA_OFF = True
++            return None
++    if not _LITEDSA_MOD.litedsa_available():
++        _LITEDSA_OFF = True
++        return None
++    return _LITEDSA_MOD.litedsa_masked_mqa(
++        q, kv_c_and_k_pe_cache, topk_indices, req_id_per_token, block_table,
++        block_size, num_heads, bmm1_scale, bmm2_scale, group_size, version,
++    )
++
+ 
+ class FlashInferMLASparseBackend(AttentionBackend):
+     """FlashInfer MLA backend with sparse attention support.
+@@ -327,6 +362,48 @@
+         assert self.topk_indices_buffer is not None
+         topk_indices = self.topk_indices_buffer[:num_actual_toks]
+ 
++        # LiteDSA grouped (packed) sparse prefill attention (SM100 opt-in):
++        # pack G adjacent tokens' heads into one 128-row call over the
++        # group's top-k UNION with an exact per-query membership mask
++        # (LSE-equal to the per-token path below). G auto-derived so
++        # G * num_heads == 128 (e.g. 16 at TP8, 8 heads/rank).
++        pack_g = 128 // self.num_heads if self.num_heads > 0 else 0
++        if (
++            not _LITEDSA_OFF
++            and pack_g > 1
++            and num_actual_toks % pack_g == 0
++            and self.num_heads * pack_g == 128
++            and q.dtype == torch.float8_e4m3fn
++            and not torch.cuda.is_current_stream_capturing()
++        ):
++            if self.bmm1_scale is None:
++                self.bmm1_scale = self.scale
++                if is_quantized_kv_cache(self.kv_cache_dtype):
++                    self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
++            if self.bmm2_scale is None:
++                self.bmm2_scale = 1.0
++                if is_quantized_kv_cache(self.kv_cache_dtype):
++                    self.bmm2_scale *= layer._k_scale_float
++            from vllm.model_executor.layers.sparse_attn_indexer import (
++                _SPARSE_IDX_VERSION,
++            )
++
++            out = _litedsa_try(
++                q,
++                kv_c_and_k_pe_cache,
++                topk_indices,
++                attn_metadata.req_id_per_token,
++                attn_metadata.block_table,
++                attn_metadata.block_size,
++                self.num_heads,
++                self.bmm1_scale,
++                self.bmm2_scale,
++                pack_g,
++                _SPARSE_IDX_VERSION[0],
++            )
++            if out is not None:
++                return out, None
++
+         topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
+             attn_metadata.req_id_per_token[:num_actual_toks],
+             attn_metadata.block_table,

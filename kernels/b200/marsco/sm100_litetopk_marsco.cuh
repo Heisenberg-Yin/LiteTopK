@@ -1,9 +1,4 @@
-// TidalDecode GQA inner-product top-k — Blackwell / B200 SM100 port.
-//
-// Ported from the Hopper WGMMA kernel
-// hopper_gqa_smalln_score_to_sparse_m64n8_full_kernel to Blackwell tcgen05 UMMA
-// + Tensor Memory, reusing the proven SM100 pipeline / sparse epilogue /
-// spare-warp refresh from the DSA port (sm100_dsa_marsco.cuh).
+// LiteTopK GQA inner-product scan for Blackwell / B200 SM100.
 //
 // fp16 note: for fp16 a 128B swizzle atom holds 64 half elements, so the UMMA
 // K-major descriptors use BLOCK_K=64 (D is split into D/64 swizzle atoms, each
@@ -39,8 +34,7 @@ using namespace deep_gemm::sm100;
 #define LITETOPK_REFRESH_STRIDE 16
 #endif
 
-// Warp-local candidate queue (ported from the DSA B200 kernel's
-// DSA_WARP_QUEUE): passing lanes append into a per-(warp, row) shared-memory
+// Warp-local candidate queue: passing lanes append into a per-(warp, row) shared-memory
 // queue and flush with ONE qcount atomicAdd + coalesced stores once full,
 // instead of one atomic + scattered streaming stores per tile.
 #ifndef LITETOPK_WARP_QUEUE
@@ -86,7 +80,7 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
                     int32_t* __restrict__ bcount,         // [Rwork, num_buckets]
                     int32_t* __restrict__ cta_done,       // [n_head_groups] zeroed CTA-completion counters
                                                           // (nullptr: skip the in-kernel final refresh)
-                    __half* __restrict__ dense_out,       // non-null: ablation-baseline mode — write every
+                    __half* __restrict__ dense_out,       // non-null: dense reference mode — write every
                                                           // score to [n_head_groups*logical_rows, buf_cap]
                                                           // and skip the sparse gate/emit entirely
                     cand_t* __restrict__ buf_val,         // [Rwork, buf_cap] x=-IP (fp16 or fp32)
@@ -95,13 +89,8 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
                     const uint32_t num_buckets,
                     const uint32_t topk,
                     const uint32_t refresh_every,
-                    const bool store_bucket_space,   // see epilogue: false keeps the legacy
-                                                      // "store raw score" behavior, required
-                                                      // when tail-mode seed prefill (the
-                                                      // arch-agnostic launch_hopper_seed_from_
-                                                      // sample_fp16) shares buf_val with the scan
-                                                      // — that kernel is unaware of bucket-space
-                                                      // storage and always writes raw scores.
+                    const bool store_bucket_space,   // true stores affine bucket coordinates;
+                                                      // false stores raw scores
                     const __grid_constant__ cute::TmaDescriptor tensor_map_q,   // [Hgrp*QN, D]
                     const __grid_constant__ cute::TmaDescriptor tensor_map_kv) { // [hkv*M, D]
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -179,9 +168,8 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
     auto kv_progress_ptr    = reinterpret_cast<volatile int*>(tmem_ptr_in_smem + 2);
 
     // Warp-local candidate queue: only for the small-QN (GQA) shape — at QN=64
-    // the per-(warp, row) queues would need ~50KB of smem; the direct-atomic
-    // emit is used instead (the h100 marsco bundle makes the same choice for
-    // bs >= 32).
+    // the per-(warp, row) queues require additional shared memory, so the
+    // direct-atomic emit is used instead.
     constexpr bool kUseWarpQueue = LITETOPK_WARP_QUEUE && (QN <= 8);
     constexpr uint32_t kNumMathWarps = kNumMathThreads / 32;
     auto warpq_count = reinterpret_cast<int32_t*>(tmem_ptr_in_smem + 4);
@@ -356,10 +344,8 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
             if (in_scan_refresh) {
                 const uint32_t spare_id = warp_idx - (kNumMathThreads / 32 + 2);
                 constexpr uint32_t kNumSpare = (kNumSpecializedThreads / 32) - 2;
-                // NOTE: no refresh on scan_done — a teardown refresh cannot help
-                // this kernel anymore and the host always runs
-                // refresh_threshold_from_bcount right after; the teardown pass's
-                // cold bcount reads (~3-5 µs) also serialize CTA exit across waves.
+                // The final threshold is handled after all CTAs complete, so
+                // this poller exits without another scan_done refresh.
                 int last = 0;
                 while (true) {
                     const int d = *scan_done_flag, p = *kv_progress_ptr;
@@ -455,8 +441,8 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
                     empty_umma_barriers[warpgroup_idx * kNumAccBufs + acc_buf]->arrive();
 
                 if (dense_out != nullptr) {
-                    // "Ours-dense" ablation baseline: same TMA/UMMA/TMEM engine,
-                    // dense-store epilogue (the downstream top-k is torch.topk).
+                    // Dense reference mode writes every score; the caller
+                    // performs the final top-k selection.
                     if (kv_valid) {
                         #pragma unroll
                         for (uint32_t r = 0; r < 8; ++r) {
@@ -466,29 +452,25 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
                         }
                     }
                 } else {
-                // Batched-vote emit (ported from the DSA kernel): first compute
+                // Batched-vote emit: first compute
                 // the slice's row predicates with pure register ops (pass_bits),
                 // then ONE __any_sync decides whether the warp enters the emit
                 // machinery. __any_sync is warp-uniform, so the whole warp
                 // branches together and the per-row ballot/shfl/syncwarp logic
                 // inside participates with full masks.
-                // 候选缓冲存"桶空间坐标" bq = (x-o)*inv（仿射变换，严格保序，不是
+                // 候选缓冲可存"桶空间坐标" bq = (x-o)*inv（仿射变换，严格保序，不是
                 // 取整后的桶号）而不是原始分数 x：select 全程只需要 bq 的相对顺序
                 // （radix/边界选择的比较、排序在 bq 空间和 x 空间等价），原始分数
                 // 只在最终 K 个输出处一次性转回（host 侧 val = bq*delta+o，见
                 // litetopk_sm100_torch.cu 的 debucket 步骤），不必在扫描/select 的每
-                // 候选路径上都保留/重算——仅当 store_bucket_space 时启用；tail-mode
-                // 种子预填（launch_hopper_seed_from_sample_fp16，arch-agnostic 共享
-                // kernel）不知道这个约定、总是写原始分数，与它共享 buf_val 时必须
-                // 退回旧行为（存 x），否则同一缓冲区里桶空间值和原始分数会混着算。
+                // 候选路径上都保留/重算。store_bucket_space=false 时缓冲区存原始分数。
                 float cand_reg[8];   // 存入 buf_val 的值: bq(桶空间)或 x(原始分数), 见上方注释
                 int b_reg[8];
                 uint32_t pass_bits = 0;
                 #pragma unroll
                 for (uint32_t r = 0; r < 8; ++r) {
                     if (rbase + r >= logical_rows) continue;
-                    // 门检/桶号就地只算一次，无条件直线码（ILP 交错；把工作挪进
-                    // if(g) 反而串行化，实测 +13%）。fp32 路径桶号与 select 从
+                    // 门检/桶号就地只算一次。fp32 路径桶号与 select 从
                     // 存储值重算的是同一表达式，天然一致；fp16 候选仍需按"实际存储
                     // 值"的圆整重推桶号（不变式）——根据 store_bucket_space 圆整的
                     // 对象是 bq 还是 x。
@@ -630,8 +612,7 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
 
     __syncthreads();   // all of this CTA's emissions / bcount atomics issued
 
-    // Last-CTA-per-head-group final threshold refresh. Replaces the separate
-    // host refresh kernel between scan and select (one less launch). The
+    // Last-CTA-per-head-group final threshold refresh. The
     // threadfence + atomic completion counter is the standard release/acquire
     // handshake: when a CTA's atomicAdd returns gridDim.y-1, every sibling
     // CTA's bcount atomics are L2-visible; bcount is then read with __ldcg to

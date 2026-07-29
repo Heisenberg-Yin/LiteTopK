@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Standalone tvm_ffi port of litedsa (grouped packed sparse prefill attention
-// for DSA models on SM100), adapted from vllm-litetopk-longcat's
-// csrc/libtorch_stable/attention/dsa/litedsa.cu (torch::stable::Tensor /
-// STD_TORCH_CHECK) to this repro's tvm_ffi TensorView binding style, matching
-// dsa_indexer.cu's pattern. Kernel logic unchanged: litedsa_union_qm (union +
-// membership + fused logical->physical conversion, include/flashinfer/litedsa/
-// litedsa_union.cuh) and litedsa_masked_mla_fp8 (SM100 head128 fp8 sparse
-// prefill forward, vendored FlashMLA derivative under vendor_fmla/).
+// TVM-FFI binding for grouped packed sparse prefill attention on SM100.
+// litedsa_union_qm builds the union, membership bitmap, and physical indices.
+// litedsa_masked_mla_fp8 invokes the vendored FlashMLA-derived FP8 kernel
+// under csrc/vendor_fmla/.
 
 #include <cuda_runtime.h>
 

@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
-"""Build N-layer truncated models from the OFFICIAL FP8 checkpoint.
+"""Build an N-layer model from a sharded GLM FP8 checkpoint.
 
-Usage (container python, needs safetensors):
-    python build_fp8_truncated.py 16 /models/glm5-prefill-model-fp8
-    python build_fp8_truncated.py 1  /models/glm5-prefill-model-fp8-1l
+Shards containing only retained tensors are symlinked. Mixed shards are
+rewritten, shared-indexer tensors are copied to the names required by vLLM,
+and per-layer configuration lists are truncated. ``MODEL_SRC`` selects the
+source checkpoint and ``MODEL_AUX`` selects tokenizer/configuration assets.
 
-Steps:
-  1. shard filtering: pure shards symlinked, mixed shards rewritten;
-  2. shared-indexer patch: layers whose indexer_type == 'shared' get the FULL
-     layer's indexer tensor group copied under their own names (vLLM's strict
-     loader wants every param). Copies by name prefix, so fp8 weight +
-     weight_scale_inv pairs come along automatically;
-  3. config: num_hidden_layers=N, every per-layer list truncated to N;
-  4. tokenizer/aux json files copied from /models/glm5.
+Usage:
+    MODEL_SRC=/models/glm5-fp8 MODEL_AUX=/models/glm5 \
+      python build_fp8_truncated.py 16 /models/glm5-fp8-16l
 """
 import json
 import os
@@ -22,14 +18,32 @@ import sys
 
 from safetensors.torch import load_file, save_file
 
-SRC = "/models/glm5-fp8-official"
-AUX = "/models/glm5"  # tokenizer etc.
+if len(sys.argv) != 3:
+    raise SystemExit(
+        f"usage: {os.path.basename(sys.argv[0])} NUM_LAYERS DESTINATION"
+    )
 
+SRC = os.path.abspath(
+    os.environ.get("MODEL_SRC", "/models/glm5-fp8-official")
+)
+AUX = os.path.abspath(os.environ.get("MODEL_AUX", "/models/glm5"))
 LAYERS = int(sys.argv[1])
-DST = sys.argv[2]
+DST = os.path.abspath(sys.argv[2])
+
+if LAYERS < 1:
+    raise ValueError("NUM_LAYERS must be at least 1")
+if DST == SRC:
+    raise ValueError("DESTINATION must differ from MODEL_SRC")
+if not os.path.isfile(os.path.join(SRC, "model.safetensors.index.json")):
+    raise FileNotFoundError(f"source checkpoint index not found under {SRC}")
+if not os.path.isfile(os.path.join(SRC, "config.json")):
+    raise FileNotFoundError(f"source config not found under {SRC}")
+if not os.path.isdir(AUX):
+    raise FileNotFoundError(f"MODEL_AUX directory does not exist: {AUX}")
 os.makedirs(DST, exist_ok=True)
 
-cfg = json.load(open(os.path.join(SRC, "config.json")))
+with open(os.path.join(SRC, "config.json"), encoding="utf-8") as f:
+    cfg = json.load(f)
 indexer_types = cfg.get("indexer_types", ["full"] * LAYERS)[:LAYERS]
 # map each shared layer to its governing full layer (nearest full above it)
 share_map = {}
@@ -38,7 +52,8 @@ for i, t in enumerate(indexer_types):
     if t == "full":
         last_full = i
     elif t == "shared":
-        assert last_full is not None, "shared layer before any full layer"
+        if last_full is None:
+            raise ValueError("shared layer appears before any full layer")
         share_map[i] = last_full
 print(f"layers={LAYERS} shared->full map: {share_map}")
 
@@ -48,7 +63,10 @@ def needed(name):
     return int(m.group(1)) < LAYERS if m else True
 
 
-idx = json.load(open(os.path.join(SRC, "model.safetensors.index.json")))
+with open(
+    os.path.join(SRC, "model.safetensors.index.json"), encoding="utf-8"
+) as f:
+    idx = json.load(f)
 wm = idx["weight_map"]
 by_file = {}
 for name, f in wm.items():
@@ -92,14 +110,17 @@ if share_map:
         new_map[n] = pf
     print(f"[patch] {len(patch)} shared-indexer tensors -> {pf}")
 
-json.dump({"metadata": {"total_size": 0}, "weight_map": new_map},
-          open(os.path.join(DST, "model.safetensors.index.json"), "w"))
+with open(
+    os.path.join(DST, "model.safetensors.index.json"), "w", encoding="utf-8"
+) as f:
+    json.dump({"metadata": {"total_size": 0}, "weight_map": new_map}, f)
 
 cfg["num_hidden_layers"] = LAYERS
 for k, v in list(cfg.items()):
     if isinstance(v, list) and len(v) == 78:
         cfg[k] = v[:LAYERS]
-json.dump(cfg, open(os.path.join(DST, "config.json"), "w"), indent=2)
+with open(os.path.join(DST, "config.json"), "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2)
 
 for f in os.listdir(AUX):
     if f in ("tokenizer.json", "tokenizer_config.json", "generation_config.json",

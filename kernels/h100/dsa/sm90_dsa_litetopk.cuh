@@ -1,41 +1,19 @@
-// LiteTopK DSA scoring kernel V3 — H100 (SM90) port of sm100_dsa_litetopk.cuh.
+// H100 (SM90) LiteTopK DSA scoring kernel.
 //
-// What carries over from the B200 V3 "hybrid" unchanged (arch-agnostic):
-//   * V1 NON-persistent KV-split scheduling: blockIdx.x = q-block,
-//     blockIdx.y = KV split window (fills all 132 SMs on tiny-Q vLLM chunks);
-//   * LiteTopK sparse epilogue: strided gate reload (GATE_STRIDE prefetch),
-//     warp-local candidate queues with REGISTER fill counts (qn_reg),
-//     redux.sync row-union pruning, batched-vote emit, streaming cand stores;
-//   * spare-warp threshold-refresh daemon (2 idle producer-warpgroup warps,
-//     progress polling + __nanosleep) + per-CTA smem histogram feed;
-//   * probe compaction (magic mul-shift) deferred to drain; ragged-Q padded
-//     rows forced to an empty KV range; interior-block range-check elision;
-//   * setmaxnreg register redistribution (Hopper-native feature).
+// The kernel uses a non-persistent KV-split grid, warp-local candidate queues,
+// row-union pruning, streaming candidate stores, and spare warps that refresh
+// per-row thresholds while the scan runs. Probe-index remapping is deferred to
+// queue drain, and padded rows of a ragged query block use an empty KV range.
 //
-// What is REPLACED (no SM90 equivalent for the Blackwell features):
-//   * tcgen05.mma (UMMA) + dedicated UMMA-issue warp  ->  WGMMA (m64) issued
-//     by the math warpgroups themselves (register accumulators, commit/wait
-//     fencing). The full_umma/empty_umma barrier pair disappears.
-//   * TMEM accumulators + per-row 32dp32b tcgen05.ld  ->  wgmma register
-//     fragments. The B200 "1 math thread = 1 KV row" mapping becomes the
-//     deep_gemm SM90 layout: each thread holds 2 KV rows (lane/4 and
-//     lane/4+8 within its warp's 16 rows) with its own kNumHeads/4 column
-//     subset; the head reduction needs a quad shfl_xor, after which the 4
-//     lanes of a quad hold the SAME two row scores -> emit elects lane%4==0
-//     representatives (8+8 candidates per warp ballot instead of 32).
-//   * "early UMMA release" / tight tcgen05 fencing  ->  warpgroup_wait<0>
-//     (all-at-once; SM90 cannot release the accumulator per row-pair).
+// Math warpgroups issue WGMMA with register accumulators. Each thread owns two
+// KV rows and a kNumHeads/4 column subset; a quad shuffle reduces each score,
+// and lane%4==0 representatives emit the two unique row results. The fragment
+// mapping and ReLU-weighted scoring math follow DeepGEMM 2.5's
+// sm90_fp8_mqa_logits implementation.
 //
-// Scoring math (WGMMA + per-head fmaxf(.,0)*weight + weighted sum + per-KV
-// scale + quad reduction) is taken VERBATIM from
-// deep_gemm/impls/sm90_fp8_mqa_logits.cuh (DeepGEMM 2.5, the vLLM-pinned
-// version) — the same generation discipline as the B200 V3 kernel.
-//
-// Supported gate variants: default (negated-threshold compare) and
-// DSA_BUCKET_GATE4 (bucket-space float end-to-end, the shipped B200 default).
-// The B200 A/B leftovers (BUCKET_GATE1-3, LANE/DIRECT emit, BULK_DRAIN,
-// PERSIST, HIST_DEFER, *_NULL diagnostics) are NOT ported — see the #error
-// guards below and kernels/h100/README.md for why.
+// Scores and candidate values remain in bucket-space float coordinates from
+// the scan through selection. The host-side select therefore uses an identity
+// affine transform while preserving each row's bucket threshold.
 
 #pragma once
 
@@ -58,12 +36,6 @@
 namespace dsa_litetopk {
 
 using namespace deep_gemm;
-
-#if defined(DSA_PERSIST) || defined(DSA_EMIT_NULL) \
-    || defined(DSA_GATE_NULL) || defined(DSA_HIST_DEFER) || defined(DSA_BUCKET_GATE) \
-    || defined(DSA_BUCKET_GATE2)
-#error "SM90 port: only the default gate and DSA_BUCKET_GATE4 are ported (see kernels/h100/README.md)"
-#endif
 
 #ifndef DSA_WARP_QUEUE_CAP
 #define DSA_WARP_QUEUE_CAP 64
@@ -124,7 +96,7 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
 
     DG_STATIC_ASSERT(kNumSpecializedThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
     DG_STATIC_ASSERT(BLOCK_KV == kNumMathWarpGroups * WGMMA::M, "BLOCK_KV must be 64 rows per math warpgroup");
-    DG_STATIC_ASSERT(kNumQStages == 1, "V1 scheduling holds one q-block per CTA");
+    DG_STATIC_ASSERT(kNumQStages == 1, "one query block per CTA is required");
 
     if (warp_idx == kSpecWarpStart) {
         cute::prefetch_tma_descriptor(&tensor_map_q);
@@ -144,8 +116,8 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
     DG_STATIC_ASSERT(SMEM_Q_SIZE_PER_STAGE % kSwizzleAlignment == 0, "Unaligned TMA swizzling");
     DG_STATIC_ASSERT(SMEM_KV_SIZE_PER_STAGE % kSwizzleAlignment == 0, "Unaligned TMA swizzling");
 
-    // Layout mirrors the B200 kernel: q stages, weights, kv stages, kv scales,
-    // barriers, aux slots, warp queues, per-CTA refresh histogram.
+    // Shared-memory layout: q stages, weights, kv stages, kv scales,
+    // barriers, auxiliary flags, warp queues, and an optional histogram.
     auto smem_q = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_Q_SIZE_PER_STAGE * i);
     });
@@ -169,18 +141,17 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
     auto full_kv_barriers  = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + i); });
     auto empty_kv_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + kNumKVStages + i); });
 
-    // Aux slot 0 kept reserved so the host smem accounting matches the B200
-    // layout shape (it held the TMEM pointer there; SM90 has no TMEM).
+    // Auxiliary slot 0 is reserved so host and kernel shared-memory
+    // accounting agree. Slots 1 and 2 hold scan_done and kv_progress.
     auto aux_ptr = reinterpret_cast<uint32_t*>(barrier_ptr + kNumQStages * 2 + kNumKVStages * 2);
     auto scan_done_flag = reinterpret_cast<volatile int*>(aux_ptr + 1);
     auto kv_progress_ptr = reinterpret_cast<volatile int*>(aux_ptr + 2);
     auto warpq_count = reinterpret_cast<int32_t*>(aux_ptr + 4);
     auto warpq_val = reinterpret_cast<float*>(warpq_count + kNumMathWarps * BLOCK_Q);
     auto warpq_idx = reinterpret_cast<int32_t*>(warpq_val + kNumMathWarps * BLOCK_Q * DSA_WARP_QUEUE_CAP);
-    // Per-CTA refresh histogram (BLOCK_Q x num_buckets) — same single-scanner
-    // optimization as B200: when num_kv_splits == 1 the per-candidate
-    // histogram feed goes to smem instead of RED.GLOBAL. A racing read can
-    // only UNDERcount -> looser gate -> recall-safe.
+    // With one KV split, per-candidate refresh counts remain in shared memory
+    // instead of using global atomics. A racing read can only undercount,
+    // which makes the gate looser and therefore remains recall-safe.
     auto smem_hist = reinterpret_cast<int32_t*>(warpq_idx + kNumMathWarps * BLOCK_Q * DSA_WARP_QUEUE_CAP);
 
     DG_STATIC_ASSERT(kNumSpecializedThreads % 128 == 0 and kNumSpecializedThreads >= 64, "Invalid threads");
@@ -207,23 +178,13 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
     }
     __syncthreads();
 
-#ifdef DSA_REGS_224
-    // SM90 budget: math warpgroups hold the WGMMA accumulator in REGISTERS
-    // (kNumAccum = BLOCK_Q*kNumHeads/2 per thread), unlike B200 where it
-    // lives in TMEM — so "spend everything on math" tops out lower here.
-    // 224x256 + 32x128 = 61440 (4096 slack).
-    constexpr uint32_t kNumSpecializedRegisters = 32;
-    constexpr uint32_t kNumMathRegisters = 224;
-#else
-    // Default: 184/40 (51 200 total) — accum(64) + weights(8/q-row) +
-    // epilogue state fit without spills; bump via DSA_REGS_224 if NCU says
-    // otherwise on real hardware.
+    // The 184/40 math/specialized split accommodates WGMMA accumulators,
+    // per-row weights, and sparse-epilogue state within the register budget.
     constexpr uint32_t kNumSpecializedRegisters = 40;
     constexpr uint32_t kNumMathRegisters = 184;
-#endif
 
-    // V1 KV-split scheduling: blockIdx.x = q-block (one per CTA), blockIdx.y =
-    // contiguous KV sub-window. Split boundaries are BLOCK_KV-aligned.
+    // blockIdx.x selects one query block and blockIdx.y selects a contiguous,
+    // BLOCK_KV-aligned KV sub-window.
     const uint32_t block_q_idx = blockIdx.x;
     const uint32_t kv_split = blockIdx.y;
     uint32_t seq_k_start[BLOCK_Q], seq_k_end[BLOCK_Q];
@@ -283,10 +244,8 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
             }
         }
     } else if (warp_idx == kSpecWarpStart + 1 or warp_idx == kSpecWarpStart + 2) {
-        // Spare-warp threshold-refresh daemon — verbatim B200 V1 semantics
-        // (fixed rows, free-running, progress polling). On B200 these were
-        // spec warps 2/3 (warp 1 was the UMMA issuer); with WGMMA issued by
-        // the math warpgroups the daemon moves up to warps 1/2.
+        // Spare warps refresh fixed query rows from the global and optional
+        // per-CTA histograms while math warpgroups issue WGMMA.
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
 
         const bool in_scan_refresh = (refresh_every > 0 && refresh_every != 0x7fffffff);
@@ -362,8 +321,7 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
             CUTE_TIE_DECL(load_schedule(block_q_idx), kv_start, num_kv_blocks);
             full_q_barriers[0]->wait(0);
 
-            // Weights into registers (once per CTA): only this thread's
-            // kNumHeads/4 column subset — cheaper than the B200 full row.
+            // Load this thread's kNumHeads/4 weight-column subset once per CTA.
             #pragma unroll
             for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
                 #pragma unroll
@@ -372,28 +330,24 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
             }
             // Queue fill counts are warp-uniform: every lane tracks them
             // redundantly in registers (qn_reg) — no smem bookkeeping, no
-            // shfl broadcast on the hot emit path (the B200 V3 win).
+            // shfl broadcast on the emit path.
             int qn_reg[BLOCK_Q];
             #pragma unroll
             for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
                 const uint32_t rq = min(block_q_idx * BLOCK_Q + i, seq_len - 1);
                 o_reg[i] = origin[rq];
                 inv_reg[i] = inv_delta[rq];
-#ifdef DSA_BUCKET_GATE4
-                // GATE4 (shipped B200 default): bucket-space FLOAT end to end.
-                // bq = v' + c0 where v' accumulates with -inv folded into the
-                // register weights; gate = INT compare of bq's bits vs edge
-                // float(g+1) bits. cand_val stores bq itself. vth_reg = c0 =
-                // -o*inv; o_reg is repurposed to hold the edge float.
+                // Score directly in bucket coordinates. bq = v' - o*inv, where
+                // v' accumulates with -inv folded into the register weights.
+                // The gate compares bq's bits with the positive edge float(g+1);
+                // cand_val stores bq and select uses the identity affine.
                 vth_reg[i] = -o_reg[i] * inv_reg[i];
                 o_reg[i] = 0.0f;  // gate closed until the first consume
-#endif
                 gate_reg[i] = cute::numeric_limits<int32_t>::max();
                 qn_reg[i] = 0;
                 kstart_reg[i] = seq_k_start[i];
                 kspan_reg[i] = seq_k_end[i] > seq_k_start[i] ? seq_k_end[i] - seq_k_start[i] : 0;
             }
-#ifdef DSA_BUCKET_GATE4
             // Fold -inv into the register weights: the whole ReLU-weighted
             // chain then accumulates directly in bucket units.
             #pragma unroll
@@ -402,7 +356,6 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                 for (uint32_t j = 0; j < kNumHeads / 4; ++ j)
                     weights[i][j] *= -inv_reg[i];
             }
-#endif
             // Interior-block bounds (warp-uniform): a kv block fully inside
             // every row's [ks, ke) needs no per-element range checks.
             uint32_t rs_max = 0, re_min = 0xffffffffu;
@@ -412,9 +365,9 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                 re_min = min(re_min, kstart_reg[i] + kspan_reg[i]);
             }
 
-            // Gate PREFETCH (B200 V3): consume the th_bucket value fetched one
-            // GATE_STRIDE window earlier; issue the next window's load right
-            // after. One-window-stale is recall-safe (refresh only TIGHTENS).
+            // Consume the th_bucket value prefetched one window earlier and
+            // issue the next load immediately. Refresh only tightens the
+            // threshold, so a stale value can only admit extra candidates.
             int th_pf[BLOCK_Q];
             #pragma unroll
             for (uint32_t i = 0; i < BLOCK_Q; ++ i)
@@ -454,17 +407,8 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                         const int g = th_pf[i];
                         if (g != gate_reg[i]) {
                             gate_reg[i] = g;
-#ifdef DSA_BUCKET_GATE4
                             // edge = float(g+1): exact for small ints.
                             o_reg[i] = static_cast<float>(g + 1);
-#else
-                            // Negated threshold: emit <=> x < o+(g+1)/inv
-                            // <=> v > vth (v is the positive reduced score,
-                            // one FSETP on the hot path; the B200 FFMA sign
-                            // trick has nothing to absorb here because the
-                            // quad reduction already produced the final v).
-                            vth_reg[i] = -(o_reg[i] + static_cast<float>(g + 1) / inv_reg[i]);
-#endif
                         }
                     }
                     #pragma unroll
@@ -475,7 +419,7 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                 float scale_kv_0 = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + warp_offset + v_0_offset);
                 float scale_kv_1 = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + warp_offset + v_1_offset);
 
-                // WGMMA scoring — verbatim deep_gemm sm90_fp8_mqa_logits.
+                // WGMMA scoring with the DeepGEMM SM90 fragment mapping.
                 DG_STATIC_ASSERT(kHeadDim % WGMMA::K == 0, "Invalid head dim");
                 #pragma unroll
                 for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
@@ -499,8 +443,8 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
 
                 empty_kv_barriers[kv_stage_idx]->arrive();
 
-                // Reduce over heads + gate, all rows first (mirrors the B200
-                // two-phase structure so collectives stay out of the reduce).
+                // Reduce over heads and form all row predicates before the
+                // shared reduction and queue path below.
                 const auto kv_offset = kv_start + kv_block_idx * BLOCK_KV + warp_offset;
                 static constexpr uint32_t kNumAccumPerReduce = kNumHeads / 2;
                 DG_STATIC_ASSERT(WGMMA::kNumAccum % kNumAccumPerReduce == 0, "Invalid accumulation");
@@ -510,7 +454,6 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                 uint32_t p0_bits = 0, p1_bits = 0;
                 float x0_row[BLOCK_Q], x1_row[BLOCK_Q];
 
-#ifdef DSA_BUCKET_GATE4
                 #define DSA_SCORE_GATE(i, RC)                                                  \
                         const float bq0 = v_0 + vth_reg[i];                                    \
                         const float bq1 = v_1 + vth_reg[i];                                    \
@@ -524,19 +467,6 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                         }                                                                      \
                         p0_bits |= g0 ? (1u << i) : 0u;                                        \
                         p1_bits |= g1 ? (1u << i) : 0u;
-#else
-                #define DSA_SCORE_GATE(i, RC)                                                  \
-                        x0_row[i] = -v_0;                                                      \
-                        x1_row[i] = -v_1;                                                      \
-                        bool g0 = v_0 > vth_reg[i];                                            \
-                        bool g1 = v_1 > vth_reg[i];                                            \
-                        if constexpr (RC) {                                                    \
-                            g0 = g0 and ((kv_offset + v_0_offset - kstart_reg[i]) < kspan_reg[i]); \
-                            g1 = g1 and ((kv_offset + v_1_offset - kstart_reg[i]) < kspan_reg[i]); \
-                        }                                                                      \
-                        p0_bits |= g0 ? (1u << i) : 0u;                                        \
-                        p1_bits |= g1 ? (1u << i) : 0u;
-#endif
                 const uint32_t kv_base = kv_start + kv_block_idx * BLOCK_KV;
                 const bool interior = (kv_base >= rs_max) && (kv_base + BLOCK_KV <= re_min);
                 #define DSA_SCORE_ROWS(RANGE_CHECK)                                            \
@@ -594,13 +524,9 @@ void sm90_dsa_litetopk(const uint32_t seq_len, const uint32_t seq_len_kv,
                             const unsigned below = (1u << lane_idx) - 1u;
                             const auto feed_hist = [&](const float x) {
                                 if (refresh_every > 0) {
-#ifdef DSA_BUCKET_GATE4
                                     // one F2I off the stored bucket float —
                                     // bucket-identical to the gate.
                                     int braw = static_cast<int>(x);
-#else
-                                    int braw = static_cast<int>((x - o_reg[i]) * inv_reg[i]);
-#endif
                                     int b = braw < 0 ? 0 : (braw > static_cast<int>(num_buckets) - 1 ? static_cast<int>(num_buckets) - 1 : braw);
                                     if (hist_in_smem) {
                                         atomicAdd(smem_hist + i * num_buckets + b, 1);

@@ -278,9 +278,8 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         const auto& v_offset = lane_idx;
 
         // Preload weights
-        // PATCH (SGLang #19529): clamp kNumWeightsInReg so num_heads < 52 (e.g.
-        // GLM-5 DSA index_n_heads=32) still compiles. Original hard-coded 52
-        // required num_heads >= 52 (DeepSeek V3.2 uses 64).
+        // Limit the preload to the available heads. The original fixed value
+        // of 52 is invalid when num_heads is smaller.
         constexpr uint32_t kNumWeightsInReg = (kNumHeads < 52) ? (kNumHeads / 4 * 4) : 52;
         float weights[BLOCK_Q][kNumWeightsInReg];
         DG_STATIC_ASSERT(kNumWeightsInReg <= kNumHeads and kNumWeightsInReg % 4 == 0, "Invalid kNumWeightsInReg");

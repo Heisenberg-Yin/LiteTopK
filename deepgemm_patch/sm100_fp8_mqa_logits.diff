@@ -1,13 +1,12 @@
---- /opt/venvs/deepgemm/lib/python3.12/site-packages/deep_gemm/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh	2026-03-02 12:05:06.473536378 +0000
-+++ /opt/litetopk_repro/deepgemm_patch/sm100_fp8_mqa_logits.cuh	2026-07-12 16:39:58.383784419 +0000
-@@ -278,7 +278,10 @@
+--- a/deep_gemm/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh
+@@ -278,7 +278,9 @@
          const auto& v_offset = lane_idx;
  
          // Preload weights
 -        constexpr uint32_t kNumWeightsInReg = 52;
-+        // PATCH (SGLang #19529): clamp kNumWeightsInReg so num_heads < 52 (e.g.
-+        // GLM-5 DSA index_n_heads=32) still compiles. Original hard-coded 52
-+        // required num_heads >= 52 (DeepSeek V3.2 uses 64).
++        // Limit the preload to the available heads. The original fixed value
++        // of 52 is invalid when num_heads is smaller.
 +        constexpr uint32_t kNumWeightsInReg = (kNumHeads < 52) ? (kNumHeads / 4 * 4) : 52;
          float weights[BLOCK_Q][kNumWeightsInReg];
          DG_STATIC_ASSERT(kNumWeightsInReg <= kNumHeads and kNumWeightsInReg % 4 == 0, "Invalid kNumWeightsInReg");

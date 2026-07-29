@@ -1,35 +1,22 @@
-// TidalDecode / MS MARCO GQA inner-product top-k — H100 (SM90) port of
-// kernels/b200/marsco/sm100_litetopk_marsco.cuh.
+// LiteTopK GQA inner-product scan for H100 / SM90.
 //
-// The B200 kernel was itself ported FROM the Hopper WGMMA kernel
-// (hopper_gqa_smalln_score_to_sparse_m64n8_full_kernel); this file brings the
-// B200-side improvements BACK to SM90 on top of the deep_gemm-style pipeline:
-//   * chunked-D TMA pipeline (MS MARCO 768-d embeddings) — unchanged;
+// The kernel uses:
+//   * a chunked-D TMA pipeline for MS MARCO 768-d embeddings;
 //   * bucket-space candidate storage (store_bucket_space) + fp16 rounding
-//     invariant (bucket re-derived from the ROUNDED stored value) — unchanged;
+//     invariant (bucket re-derived from the rounded stored value);
 //   * register-count warp queues (qn_reg) for QN<=8, parallel-reservation
-//     direct-atomic emit for QN=64 — unchanged;
+//     direct-atomic emit for QN=64;
 //   * persistent tile-strided grid, gate-stride reload, kv-progress publish,
-//     last-CTA in-kernel final threshold refresh — unchanged.
+//     and a last-CTA in-kernel final threshold refresh.
 //
-// What is REPLACED (no SM90 equivalent):
-//   * tcgen05 UMMA issued by a dedicated warp + TMEM double-buffered
-//     accumulators + 32dp32b8x column-slice loads  ->  WGMMA m64nQNk16
-//     (F32F16F16) issued by the math warpgroups, register accumulators.
-//     The full/empty_umma barrier pairs and the acc double-buffering vanish
-//     (the accumulator lives in the consumer's registers to begin with).
-//   * B200's "1 math lane = 1 KV row" TMEM mapping  ->  the WGMMA fragment:
-//     each thread holds rows (lane/4, lane/4+8) x column pair
-//     ((lane%4)*2, +1) per 8-column group — every accumulator element is a
-//     UNIQUE (kv row, q col) candidate, so emit needs NO lane election at
-//     all (unlike the DSA port, where quad redundancy comes from the head
-//     reduction). Ballots per q column have 8 participating lanes carrying
-//     up to 2 candidates each.
+// WGMMA m64nQNk16 (F32F16F16) is issued by the math warpgroups and stores
+// accumulators in registers. Each thread holds rows (lane/4, lane/4+8) and a
+// column pair ((lane%4)*2, +1) per 8-column group. Every accumulator element
+// is a unique (KV row, query column) candidate, so emit needs no lane
+// election.
 //
 // Roles: math warps [0, kNumMathThreads/32); then 1 TMA producer warp; the
-// remaining specialized warps (spec/32 - 1) are refresh pollers (the B200
-// spec=64 build inlined refresh into the math warps because its second spec
-// warp was the UMMA issuer — on SM90 that warp is free and polls instead).
+// remaining specialized warps (spec/32 - 1) are refresh pollers.
 
 #pragma once
 
@@ -127,7 +114,7 @@ void sm90_litetopk_ip(const uint32_t M,                     // scan bound: rows 
                     int32_t* __restrict__ bcount,         // [Rwork, num_buckets]
                     int32_t* __restrict__ cta_done,       // [n_head_groups] zeroed CTA-completion counters
                                                           // (nullptr: skip the in-kernel final refresh)
-                    __half* __restrict__ dense_out,       // non-null: ablation-baseline mode
+                    __half* __restrict__ dense_out,       // non-null: dense reference mode
                     cand_t* __restrict__ buf_val,         // [Rwork, buf_cap] x=-IP (fp16 or fp32)
                     int32_t* __restrict__ buf_idx,        // [Rwork, buf_cap]
                     const uint32_t buf_cap,
@@ -162,7 +149,7 @@ void sm90_litetopk_ip(const uint32_t M,                     // scan bound: rows 
     constexpr uint32_t SW_K = 128 / sizeof(cutlass::half_t);     // 64: 128B swizzle atom (fp16)
     DG_STATIC_ASSERT(kHeadDim % SW_K == 0, "D must be multiple of 64 (fp16 128B swizzle atom)");
 
-    // Chunked-D pipeline (identical policy to the B200 kernel).
+    // Chunked-D pipeline.
     constexpr uint32_t kStageBytes = (QN > 8) ? 32768 : 65536;
     constexpr uint32_t kChunkCapElems = kStageBytes / (BM * sizeof(__half));
     constexpr uint32_t kChunkPref = (QN > 8) ? (kHeadDim > 128 ? 128 : kHeadDim)
@@ -184,8 +171,7 @@ void sm90_litetopk_ip(const uint32_t M,                     // scan bound: rows 
     auto full_kv_barriers   = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + i; });
     auto empty_kv_barriers  = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + kNumKVStages + i; });
     auto q_ready_barrier    = barrier_ptr + 2 * kNumKVStages;
-    // Slot 0 reserved (held the TMEM pointer on B200 — layout parity with the
-    // host smem accounting); 1 = scan_done, 2 = kv progress, 3 = last-CTA flag.
+    // Auxiliary slots: 1 = scan_done, 2 = KV progress, 3 = last-CTA flag.
     auto aux_ptr            = reinterpret_cast<uint32_t*>(q_ready_barrier + 1);
     auto scan_done_flag     = reinterpret_cast<volatile int*>(aux_ptr + 1);
     auto kv_progress_ptr    = reinterpret_cast<volatile int*>(aux_ptr + 2);
@@ -208,8 +194,8 @@ void sm90_litetopk_ip(const uint32_t M,                     // scan bound: rows 
         #pragma unroll
         for (uint32_t i = 0; i < kNumKVStages; ++i) {
             full_kv_barriers[i]->init(1);
-            // Every math thread consumes the stage through its own wgmma and
-            // arrives after warpgroup_wait<0> (no UMMA-warp proxy on SM90).
+            // Every math thread consumes the stage through its own WGMMA and
+            // arrives after warpgroup_wait<0>.
             empty_kv_barriers[i]->init(kNumMathThreads);
         }
         q_ready_barrier->init(1);
@@ -219,12 +205,10 @@ void sm90_litetopk_ip(const uint32_t M,                     // scan bound: rows 
     }
     __syncthreads();
 
-    // No setmaxnreg: the shipped spec=64 config launches 320 threads (not a
-    // multiple of 128 warpgroups), same as the B200 kernel — the budget comes
-    // from launch_bounds (320 threads -> 204 regs). The SM90 math side is
-    // register-light anyway (kNumAccum = QN/2 per thread, no TMEM staging).
+    // No setmaxnreg: the spec=64 configuration launches 320 threads, so the
+    // register budget comes from launch_bounds.
 
-    // Warp-collective in-scan threshold refresh (verbatim B200).
+    // Warp-collective in-scan threshold refresh.
     const auto refresh_row = [&](const uint32_t r) {
         if (r >= logical_rows) return;
         const uint32_t row = query_base + r;
@@ -250,8 +234,8 @@ void sm90_litetopk_ip(const uint32_t M,                     // scan bound: rows 
 
     if (is_tma_warp) {
         if (cute::elect_one_sync()) {
-            // Load QN query rows once (K-major, 128B swizzle); copy first,
-            // THEN arrive_and_expect_tx (the DSA/B200 ordering).
+            // Load QN query rows once (K-major, 128B swizzle), then publish
+            // the expected transaction bytes.
             tma::copy<kHeadDim, QN, 128, __half>(
                 &tensor_map_q, q_ready_barrier, smem_q, 0, query_base);
             q_ready_barrier->arrive_and_expect_tx(SMEM_Q_BYTES);
@@ -271,8 +255,7 @@ void sm90_litetopk_ip(const uint32_t M,                     // scan bound: rows 
             }
         }
     } else if (warp_idx > kNumMathThreads / 32) {
-        // Refresh-poller warps (spec/32 - 1 of them; on B200 this slot was the
-        // UMMA issuer + optional pollers).
+        // Refresh-poller warps (spec/32 - 1 of them).
         const bool in_scan_refresh = (refresh_every > 0 && refresh_every != 0x7fffffff);
         if (in_scan_refresh) {
             const uint32_t spare_id = warp_idx - (kNumMathThreads / 32 + 1);
@@ -308,7 +291,7 @@ void sm90_litetopk_ip(const uint32_t M,                     // scan bound: rows 
         const uint32_t gate_stride = (refresh_every > 0 && refresh_every != 0x7fffffff)
                                          ? refresh_every : LITETOPK_REFRESH_STRIDE;
 
-        // Register-count warp queues (B200 C1b): qn is warp-uniform, every
+        // Register-count warp queues: qn is warp-uniform, every
         // lane tracks a redundant copy — no smem bookkeeping on the hot path;
         // the warpq_count smem slots stay allocated-but-unused (host layout).
         int qn_reg[kUseWarpQueue ? QN : 1];
@@ -388,7 +371,7 @@ void sm90_litetopk_ip(const uint32_t M,                     // scan bound: rows 
                 const float* acc4 = accum + g * 4;
 
                 if (dense_out != nullptr) {
-                    // "Ours-dense" ablation: same engine, dense-store epilogue.
+                    // Dense reference mode writes every score.
                     #pragma unroll
                     for (uint32_t j = 0; j < 4; ++j) {
                         const uint32_t col = g * 8 + c_pair + (j & 1);
@@ -402,7 +385,7 @@ void sm90_litetopk_ip(const uint32_t M,                     // scan bound: rows 
 
                 // Gate the 4 held values with straight-line register code
                 // (bit j of pass_bits: j&1 = column parity, j&2 = row select),
-                // then ONE __any_sync gates the emit machinery (B200 pattern).
+                // then one __any_sync gates the emit machinery.
                 float cand_reg[4];
                 int b_reg[4];
                 uint32_t pass_bits = 0;
@@ -435,8 +418,8 @@ void sm90_litetopk_ip(const uint32_t M,                     // scan bound: rows 
 
                 if (__any_sync(0xffffffffu, pass_bits != 0u)) {
                 if constexpr (!kUseWarpQueue) {
-                    // Direct-atomic emit with PARALLEL per-column reservations
-                    // (B200 m8 pattern): lane qc<8 reserves column qc's slots
+                    // Direct-atomic emit with parallel per-column reservations:
+                    // lane qc<8 reserves column qc's slots
                     // in one warp-wide atomicAdd batch, then each holder
                     // writes at base + its ballot prefix. Ballot for column
                     // qc: the 8 lanes with lane%4 == qc/2, row via j-bit.
@@ -565,8 +548,8 @@ void sm90_litetopk_ip(const uint32_t M,                     // scan bound: rows 
 
     __syncthreads();   // all of this CTA's emissions / bcount atomics issued
 
-    // Last-CTA-per-head-group final threshold refresh (verbatim B200: the
-    // threadfence + completion-counter release/acquire handshake).
+    // Last-CTA-per-head-group final threshold refresh using a threadfence and
+    // completion-counter release/acquire handshake.
     if (cta_done != nullptr) {
         auto last_cta_flag = reinterpret_cast<volatile int*>(aux_ptr + 3);
         if (threadIdx.x == 0) {

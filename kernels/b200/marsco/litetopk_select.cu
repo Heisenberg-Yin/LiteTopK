@@ -1,7 +1,6 @@
 // LiteTopK select engine (CUDA): 采样定阈 + 单遍直方图 + 边界桶精确 topk。
 //
-//   路线（区别于 radixselect 的 4-pass radix）：借鉴 sample-range + bucket 思路，
-//   把「5 遍全量扫描」压成「采样(~1.6%) + 2 遍全量」：
+//   路线：sample-range + bucket：
 //     1. sample pass：每行单 block 在前缀采样子集(S=max(k,16384))上 in-block radix
 //        求采样第 k 小 enc 作分桶上界 hi（采样第 k 小 >= 全集第 k 小，安全），min 作下界 lo。
 //        255 个有效桶覆盖 [lo,hi]，桶 255 专放 enc>hi 的 bulk。
@@ -13,7 +12,7 @@
 //        out[count_below:k]，含 tie 处理；overflow 时重扫整行 bucket==T 保证精确。
 //
 //   单调编码（保序：v1<v2 <=> enc1<enc2）：v>=0: enc=bits^0x80000000 ; v<0: enc=~bits
-//   fp16 原生 16-bit 编码（不提升 float），pass 数减半。行首 16B 对齐(N%VEC==0)时 hist/gather
+//   fp16 使用原生 16-bit 编码。行首 16B 对齐(N%VEC==0)时 hist/gather
 //   走 float4 向量化读。
 //   workspace 由内部以 stream-ordered cudaMallocAsync 管理；topk-max 经取负 -> topk-min 实现。
 
@@ -136,9 +135,7 @@ template <> struct EncTraits<__nv_bfloat16> { static constexpr int kBits = 16; s
 
 // 向量化读：每线程一条 128-bit load（float4，16B）取代 VEC 条标量 load。
 //   fp32: VEC=4（float4）；fp16: VEC=8（float4 重解释为 8 个 __half）。
-// 目的是把 hist/gather 那遍删不掉的全量顺序读的 load 指令数降为 1/VEC，
-// 减小指令发射 / LSU / MSHR 压力，使内存流水线更饱满（带宽利用率 ~86%->~95%）。
-// 不改变搬运总字节数，不引入额外内存往返，精确性不变。
+// 每条 load 读取 VEC 个连续元素，减少 hist/gather 的 load 指令数。
 template <typename T> struct VecTraits;
 template <> struct VecTraits<float>  { static constexpr int VEC = 4; };
 template <> struct VecTraits<__half> { static constexpr int VEC = 8; };
@@ -1322,11 +1319,9 @@ __device__ __forceinline__ void ft_warp_emit_lt_direct(
     }
 }
 
-// BUCKET_SPACE: true (default) means `buf` holds the scan's bucket-space
-// coordinate bq=(x-o)*inv (no per-candidate recompute needed here — just
-// cast). false is the legacy mode where `buf` holds the raw score x,
-// required when the scan ran with store_bucket_space=false (tail-mode seed
-// prefill compatibility — see sm100_litetopk_marsco.cuh's epilogue comment).
+// BUCKET_SPACE=true means `buf` holds bq=(x-o)*inv and the bucket number is
+// obtained by casting. BUCKET_SPACE=false means `buf` holds raw scores and
+// the transform is evaluated here.
 template <typename T, typename OT, int BLOCK_THREADS_, bool STAGED = false, bool BUCKET_SPACE = true>
 __global__ void flashtopk_compact_thr_kernel(
     const T* __restrict__ buf, int M, int CAP,
@@ -1358,11 +1353,11 @@ __global__ void flashtopk_compact_thr_kernel(
     int32_t* eqi = eq_idx + (size_t)row * CAP;
     T*       ov = out_val ? (out_val + (size_t)row * K) : nullptr;
     int32_t* oi = out_idx ? (out_idx + (size_t)row * K) : nullptr;
-    // BUCKET_SPACE=true（默认）：候选缓冲 `buf` 存的直接是扫描端算好的桶空间坐标
+    // BUCKET_SPACE=true：候选缓冲 `buf` 存的是扫描端算好的桶空间坐标
     // bq=(x-o)*inv，桶号只需一次 cast，无需再做减法+乘法；原始分数只在最终 K 个
     // 输出处一次性转回（host 侧 debucket 步骤，见 litetopk_sm100_torch.cu）。
-    // BUCKET_SPACE=false（legacy，tail-mode 种子预填共享 buf_val 时用）：`buf`
-    // 存的是原始分数 x，这里仍需 origin/inv_delta 重算桶号。
+    // BUCKET_SPACE=false：`buf` 存的是原始分数 x，这里用
+    // origin/inv_delta 计算桶号。
     float origin = 0.f, inv_delta = 0.f;
     if constexpr (!BUCKET_SPACE) {
         origin = ft_to_float<OT>(origin_in[row]);
@@ -1373,10 +1368,9 @@ __global__ void flashtopk_compact_thr_kernel(
     if (limit > M) limit = M;
     if (limit < 0) limit = 0;
 
-    // warp 聚合 compact：每轮用 __ballot 拿本 warp 命中 mask，空 warp 直接跳过（零同步），
-    //   有命中的 warp 仅 leader 做 1 次 atomicAdd 拿基址，lane 用 popc 算偏移。彻底去掉
-    //   block 级 BlockScan + __syncthreads —— DENSE 满 M 扫描下绝大多数轮次无命中，旧版
-    //   每轮强制全员同步的开销淹没了访存（实测仅 13% 带宽），warp 版把空轮成本降到一次 ballot。
+    // warp 聚合 compact：每轮用 __ballot 拿本 warp 命中 mask，空 warp
+    // 直接跳过；有命中的 warp 仅 leader 做一次 atomicAdd 拿基址，lane
+    // 用 popc 算偏移。
     const int lane = threadIdx.x & 31;
     const unsigned lanemask = (1u << lane) - 1u;   // 本 lane 之前的位
 
@@ -1389,11 +1383,9 @@ __global__ void flashtopk_compact_thr_kernel(
     constexpr int VEC = (int)(sizeof(int4) / sizeof(T));   // half/bf16→8, float→4
     bool can_vec = (sample_idx == nullptr) && ((size_t)M % VEC == 0) && ((size_t)M % 4 == 0);
     if (can_vec) {
-        // STAGED（大 k 路径，host 在 !use_direct_lt 时选此实例）：ncu 实测 per-warp-emit 在
-        //   1M/k8192 下 long_scoreboard 59 cycle/issue、DRAM 仅 1.8% —— 瓶颈是每 warp 每轮
-        //   atomicAdd 全局行计数器的 L2 往返 + 64 个计数器上的原子串行化（22.9 万次 L2 原子）。
-        //   改为命中先 append 进 smem（块内原子），每轮末超水位整块 flush：一次全局原子拿
-        //   基址 + 合并写出。全局原子量降 ~30 倍。水位 SCAP-BLOCK*VEC 保证单轮 append 不溢出。
+        // STAGED 路径先把命中 append 到 shared memory，再用一次全局
+        // atomicAdd 获取整批输出基址并合并写出。水位
+        // SCAP-BLOCK*VEC 保证单轮 append 不溢出。
         //   2 字节 T 的 VEC=8，2 倍容量会顶破 48KB 静态 smem 上限 → 用 1.5 倍（水位余量 BLOCK*VEC/2）。
         constexpr int SCAP = STAGED ? (sizeof(T) >= 4 ? BLOCK_THREADS_ * VEC * 2
                                                       : BLOCK_THREADS_ * VEC * 3 / 2) : 1;

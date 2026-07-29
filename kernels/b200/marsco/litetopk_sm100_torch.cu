@@ -1,21 +1,11 @@
-// Host binding for the SM100 TidalDecode IP top-k (B200 port).
+// PyTorch host binding for B200 / SM100 inner-product top-k.
 //
 // Ops:
-//   litetopk_sm100::score_sparse(...)            -- correctness probe: bucket-gated
-//       sparse scan only (validates the fp16 UMMA IP numerics on B200).
-//   litetopk_sm100::fused_ip_sparse_b200(...) -- full TidalDecode selection,
-//       mirroring the Hopper fused_ip_gqa_sparse_paged_group_indexed pipeline:
-//         1. tail-sample dense scores  (cuBLAS bmm, x = -IP)
-//         2. flash_topk_min            (seed top-k of the sample)   [reused]
-//         3. seed_from_sample          (origin/inv_delta/th/buf)    [reused]
-//         4. SM100 UMMA/TMEM sparse scan over [0, sample_start)     [B200 kernel]
-//         5. final threshold tighten — fused into 4: the last CTA per head
-//            group refreshes th in-kernel (threadfence + completion counter)
-//         6. flash_topk_select_thr_mb  (boundary radix select)      [reused]
-//         7. negate + un-pad to [Hq, k]
-//       Steps 2/3/5/6 are the architecture-agnostic Hopper kernels compiled
-//       into the same extension; only the scan is Blackwell-specific
-//       (TMA warp + UMMA warp + TMEM + spare-warp threshold refresh).
+//   litetopk_sm100::score_sparse(...) -- bucket-gated scan helper.
+//   litetopk_sm100::dense_scores(...) -- dense score helper.
+//   litetopk_sm100::fused_ip_sparse_b200(...) -- strided sampling, seed
+//       parameter construction, SM100 sparse scan, boundary selection, and
+//       score reconstruction.
 //
 // KV layout: contiguous per-head [Hkv, M, D] fp16 (== the benchmark k_cache;
 // equals the paged NHD page_size=1 layout with identity group_indices, minus
@@ -69,13 +59,11 @@ static CUtensorMap make_2d_half(void* ptr, int gmem_inner, long gmem_outer,
     return tm;
 }
 
-// Fused sample-prep (ported from dsa_litetopk's seed_prep_kernel, params-only
-// variant): one block per row derives the bucket params directly from the raw
+// One block per row derives bucket parameters directly from the raw
 // fp16 sample scores — pass 1 min/max (o = -max, hi = -min), pass 2 smem
 // histogram -> th = bucket of the K-th best — and zeroes bcount/qcount in the
-// same launch. Replaces neg_ + flash_topk_min + add_offset + seed_from_sample
-// + two memsets (~6 passes, ~8 launches). No candidate prefill: in strided
-// mode the scan re-emits sampled rows, so prefilled seeds would double.
+// same launch. There is no candidate prefill because the full scan includes
+// sampled rows.
 __global__ void litetopk_seed_params_kernel(
     const __half* __restrict__ scores, const int64_t stride,
     const int S, const int NB, const int K,
@@ -146,24 +134,15 @@ __global__ void litetopk_seed_params_kernel(
 
 constexpr int QN = 8;
 constexpr int BM = 128;
-// KV pipeline depth. 3 stages (~104KB smem) allows 2 CTAs/SM; deeper pipelines
-// (up to 6 within the 227KB budget) drop to 1 CTA/SM — tradeoff measured via
-// the LITETOPK_KV_STAGES env of the loader.
+// Fixed KV pipeline depth used by the JIT loader and direct builds.
 #ifndef LITETOPK_KV_STAGES
 #define LITETOPK_KV_STAGES 6
 #endif
 constexpr int NUM_KV_STAGES = LITETOPK_KV_STAGES;
 constexpr int NUM_SMS = 148;       // B200
-// SPEC_THREADS hardcoded to the optimal 64: TMA + UMMA, refresh inlined into the
-// math warps (320-thread launch => 204-reg budget vs 168; +4-11% per cell). The
-// legacy 128 path (2 spare refresh warps) is removed.
+// One TMA warp and one UMMA warp; threshold refresh runs on math warps.
 constexpr int SPEC_THREADS = 64;
 constexpr int MATH_THREADS = 128;  // 1 math warpgroup, BM = 128 (one kv row per lane)
-
-static int kv_stages_for(int head_dim) {
-    // Large D uses chunked stages: 3 stages fit the smem budget.
-    return head_dim <= 128 ? NUM_KV_STAGES : 3;
-}
 
 static int stages_for(int head_dim, int bm) {
     if (bm > 128) return 3;                 // 64KB chunk stages
@@ -222,9 +201,7 @@ static void launch_sm100_scan(
                               head_dim, bm, 128);
 
     if (num_ctas_x <= 0) {
-        // Persistent tile-strided CTAs. Empirically the sparse-emit epilogue
-        // wants heavy over-subscription (best measured at ~8 waves of 2 CTAs/SM
-        // for Hkv=8): more CTAs overlap emit stalls with other CTAs' TMA/UMMA.
+        // Persistent tile-strided CTA grid.
         num_ctas_x = std::max(1, 8 * NUM_SMS / std::max(1, n_head_groups));
     }
     const int scan_tiles = (scan_end - start_row + bm - 1) / bm;
@@ -236,12 +213,8 @@ static void launch_sm100_scan(
         auto dispatch = [&](auto* kernel, auto* buf_ptr) {
             int smem = compute_smem_bytes(DD, qn, bm, out_fp32);
             cudaError_t ae = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-            // Force the MAX shared-memory carveout (minimal L1). Measured: a
-            // ~193KB request lands in the 196KB carveout bucket, leaving ~32KB
-            // MORE L1 than the 228KB bucket — and runs ~5% SLOWER at small k.
-            // Plain-load re-reads of th_bucket / gate live longer in a bigger
-            // (non-coherent) L1, so CTAs see STALER (looser) thresholds and
-            // over-emit; a minimal L1 evicts those lines back to L2 quickly.
+            // Use the maximum shared-memory carveout required by the kernel's
+            // dynamic workspace.
             cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                  cudaSharedmemCarveoutMaxShared);
             TORCH_CHECK(ae == cudaSuccess, "cudaFuncSetAttribute failed (smem=", smem, "): ", cudaGetErrorString(ae));
@@ -310,11 +283,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> litetopk_sm100_score_sparse(
     return std::make_tuple(buf_val, buf_idx, qcount);
 }
 
-// ---------------- ours-dense ablation baseline ----------------
-// Same TMA/UMMA/TMEM scan engine, dense [Hq, M] score output (the caller runs
-// torch.topk). This is the "our engine + official baseline structure" ablation:
-// it isolates the sparse-selection algorithm's contribution from the load/score
-// engine's contribution.
+// ---------------- dense score helper ----------------
+// Writes dense [Hq, M] scores; the caller performs top-k selection.
 at::Tensor litetopk_sm100_dense_scores(const at::Tensor& x, const at::Tensor& kv_cont,
                                     int64_t num_ctas_x) {
     TORCH_CHECK(x.is_cuda() && kv_cont.is_cuda(), "x/kv must be CUDA");
@@ -374,7 +344,7 @@ at::Tensor litetopk_sm100_dense_scores(const at::Tensor& x, const at::Tensor& kv
     return dense;
 }
 
-// ---------------- full fused pipeline (h100 parity) ----------------
+// ---------------- fused sparse pipeline ----------------
 std::tuple<at::Tensor, at::Tensor> fused_ip_sparse_b200(
     const at::Tensor& x, const at::Tensor& kv_cont,
     int64_t k, int64_t num_buckets, int64_t buf_cap, int64_t sample_size,
@@ -391,17 +361,10 @@ std::tuple<at::Tensor, at::Tensor> fused_ip_sparse_b200(
     TORCH_CHECK(kv_cont.size(2) == D, "head_dim mismatch");
     TORCH_CHECK(Hkv >= 1 && Hq >= Hkv && Hq % Hkv == 0, "Hq must be a multiple of Hkv");
     const int64_t group = Hq / Hkv;
-    // Two layouts: GQA (group <= QN query rows per KV head) and flat batch
-    // (Hkv == 1, N = Hq concurrent queries sharing one corpus, e.g. MS MARCO
-    // batch retrieval) — the kernel maps every head group to kv head 0 via
-    // q_group_size = n_groups.
+    // MS MARCO uses flat batch: Hkv == 1 and Hq concurrent queries share one
+    // corpus. The kernel maps every query group to KV head 0.
     const bool flat_batch = (Hkv == 1 && group > QN);
-    // Flat batch can run the QN=64 single-pass kernel (all 64 queries ride the
-    // UMMA N dimension; the corpus is read once instead of relayed through L2
-    // by 8 row groups). Measured: ~parity at low emission (k=128) but clearly
-    // behind the QN=8 warp-queue path once the emit dominates (k >= 1024), so
-    // it stays opt-in (LITETOPK_FLAT_QN=64) until the 64-row emit path gets a
-    // queue / pipelined reservations.
+    // Flat batch supports QN=8 and QN=64 execution shapes.
     static const int kFlatQn = [] {
         const char* e = getenv("LITETOPK_FLAT_QN");
         return (e && atoi(e) == 64) ? 64 : 8;
@@ -414,7 +377,7 @@ std::tuple<at::Tensor, at::Tensor> fused_ip_sparse_b200(
     const int eff_flat_qn = qn_arg == 64 ? 64 : (qn_arg == 8 ? 8 : kFlatQn);
     const int eff_bm = bm_arg == 256 ? 256 : (bm_arg == 128 ? 128 : kBm);
     const int64_t qn = (flat_batch && eff_flat_qn == 64 && Hq % 64 == 0) ? 64 : QN;
-    TORCH_CHECK(flat_batch, "flat-batch only (GQA path removed): require Hkv==1 and N (=Hq=", Hq,
+    TORCH_CHECK(flat_batch, "flat-batch mode requires Hkv==1 and N (=Hq=", Hq,
                 ") > QN=", QN);
     TORCH_CHECK(Hq % qn == 0, "flat batch requires N to be a multiple of ", qn);
     TORCH_CHECK(M % 64 == 0, "M must be a multiple of 64");
@@ -424,19 +387,9 @@ std::tuple<at::Tensor, at::Tensor> fused_ip_sparse_b200(
     sample_size = ((sample_size + 63) / 64) * 64;
     if (sample_size < k) sample_size = ((k + 63) / 64) * 64;
     if (sample_size > M) sample_size = M;
-    // sample_mode 0: contiguous tail window [M-S, M) — seeds prefilled, the
-    //   scan skips the window (attention decode: recent tokens, exchangeable).
-    // sample_mode 1: strided rows across the whole corpus — robust to corpus
-    //   ordering (e.g. MS MARCO region structure that makes a tail window
-    //   wildly unrepresentative). Seeds only set the gate; the scan covers
-    //   [0, M) fully so sampled rows re-emit naturally (no duplicates:
-    //   qcount is reset after seeding).
-    const bool strided_sample = (sample_mode == 1);
-    TORCH_CHECK(strided_sample,
-                "litetopk MARCO select: only sample_mode=1 (strided) is supported "
-                "(the legacy tail-window seed-prefill path was removed).");
-    const int64_t sample_start = strided_sample ? M : (M - sample_size);
-    const int64_t scan_end = strided_sample ? M : sample_start;
+    TORCH_CHECK(sample_mode == 1,
+                "sample_mode must be 1 (strided corpus sampling)");
+    const int64_t scan_end = M;
     if (buf_cap < k) buf_cap = k;
     if (buf_cap > M) buf_cap = M;
     const int64_t candidate_cap = buf_cap;
@@ -447,19 +400,14 @@ std::tuple<at::Tensor, at::Tensor> fused_ip_sparse_b200(
     const int64_t rows_valid = flat_batch ? qn : group;
     const int64_t Rwork = n_groups * qn;
 
-    // flat-batch only (GQA path removed): every query row is real, no padding.
+    // Every flat-batch query row is real, so no padding is required.
     at::Tensor xpad = x.contiguous();
 
-    // 1) Sample dense scores, x = -IP (cuBLAS GEMM).
-    at::Tensor kv_tail;
-    at::Tensor samp_row_idx;   // strided mode: corpus row of each sample column
-    if (strided_sample) {
-        const int64_t stride = M / sample_size;
-        samp_row_idx = at::arange(sample_size, x.options().dtype(at::kLong)) * stride;
-        kv_tail = kv_cont.index_select(1, samp_row_idx);                 // [Hkv, sample, D]
-    } else {
-        kv_tail = kv_cont.slice(1, M - sample_size, M);                  // [Hkv, sample, D]
-    }
+    // 1) Score strided sample rows.
+    const int64_t stride = M / sample_size;
+    auto samp_row_idx =
+        at::arange(sample_size, x.options().dtype(at::kLong)) * stride;
+    auto kv_tail = kv_cont.index_select(1, samp_row_idx);  // [Hkv, sample, D]
     // raw scores (no neg): the fused prep kernel handles x = -score internally.
     at::Tensor sample_scores = at::matmul(xpad, kv_tail.select(0, 0).transpose(0, 1));
     auto sample_flat = sample_scores.view({Rwork, sample_size});         // GEMM output is contiguous
@@ -471,8 +419,6 @@ std::tuple<at::Tensor, at::Tensor> fused_ip_sparse_b200(
     // also removes the fp16 bucket-rounding coupling entirely (scan histogram
     // and select both operate on the exact fp32 value).
     auto opt_c = out_fp32 ? opt_f : opt_h;
-    auto sample_val = at::empty({Rwork, k}, opt_h);
-    auto sample_idx = at::empty({Rwork, k}, opt_i);
     auto origin = at::empty({Rwork}, opt_f);
     auto inv_delta = at::empty({Rwork}, opt_f);
     auto th = at::empty({Rwork}, opt_i);
@@ -489,63 +435,53 @@ std::tuple<at::Tensor, at::Tensor> fused_ip_sparse_b200(
     auto lt_idx = at::empty({Rwork, candidate_cap}, opt_i);
     auto lt_cnt = at::empty({Rwork}, opt_i);
 
-    // 2+3) strided mode: fused sample prep (params only) replaces the
-    // topk_min/seed/offset/memset chain — see litetopk_seed_params_kernel.
-    if (strided_sample) {
-        litetopk_seed_params_kernel<<<(int)Rwork, 256, num_buckets * sizeof(int), stream>>>(
-            reinterpret_cast<const __half*>(sample_flat.data_ptr<at::Half>()),
-            sample_size, (int)sample_size, (int)num_buckets, (int)k,
-            origin.data_ptr<float>(), inv_delta.data_ptr<float>(), th.data_ptr<int>(),
-            bcount.data_ptr<int>(), qcount.data_ptr<int>());
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-    }
+    // 2) Build per-row bucket parameters and reset counters.
+    litetopk_seed_params_kernel<<<(int)Rwork, 256, num_buckets * sizeof(int), stream>>>(
+        reinterpret_cast<const __half*>(sample_flat.data_ptr<at::Half>()),
+        sample_size, (int)sample_size, (int)num_buckets, (int)k,
+        origin.data_ptr<float>(), inv_delta.data_ptr<float>(), th.data_ptr<int>(),
+        bcount.data_ptr<int>(), qcount.data_ptr<int>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     // Bucket-width floor: the select stage re-derives buckets from fp16
     // candidate values, so the bucket width (seed span / NB) must stay at
     // least a few fp16 ULPs of the score magnitude or scan(fp32)/select(fp16)
-    // classifications diverge (observed on MS MARCO where |score| ~ 70 makes
-    // ULP ~ 0.06). Clamping inv_delta DOWN only widens buckets = loosens the
-    // gate — recall-safe.
+    // classifications can diverge. Clamping inv_delta down only widens
+    // buckets and loosens the gate.
     {
         auto ulp = origin.abs().clamp_min(1.0).mul(1.0 / 1024.0);
         auto inv_max = ulp.mul(4.0).reciprocal();   // width >= 4 ULP
         inv_delta.copy_(at::minimum(inv_delta, inv_max));
     }
 
-    // 4) SM100 UMMA/TMEM sparse scan over [0, sample_start).
-    //    refresh_every <= 0 selects the h100 default: bcount is histogrammed
+    // 3) SM100 UMMA/TMEM sparse scan over the full corpus.
+    //    refresh_every <= 0 selects sentinel mode: bcount is histogrammed
     //    (0x7fffffff sentinel) and the threshold refreshed once post-scan.
     //    (The histogram is NOT optional: the thr select direct-copies the
     //    bucket<th set and is only exact when the post-scan refresh has
     //    tightened th so that cnt(bucket<th) < k.)
     const int scan_refresh = refresh_every > 0 ? (int)refresh_every : 0x7fffffff;
-    // (Strided mode: qcount/bcount zeroing is fused into
-    // litetopk_seed_params_kernel — the scan histograms every candidate exactly
-    // once over the full range, so a seed histogram would double-count.)
+    // qcount/bcount zeroing is fused into litetopk_seed_params_kernel.
     if (scan_end > 0) {
-        // 5) is fused into the scan: the last CTA of each head group performs
-        // the final threshold tighten in-kernel (threadfence + completion
-        // counter), replacing the separate refresh kernel launch.
+        // The last CTA of each head group performs the final threshold
+        // update after all candidate histograms are visible.
         auto cta_done = at::zeros({n_groups}, opt_i);
-        // store_bucket_space = strided_sample: the tail-mode seed prefill
-        // (launch_hopper_seed_from_sample_fp16, below) shares buf_val with the
-        // scan and always writes raw scores, so bucket-space storage is only
-        // safe when strided sampling skips that legacy prefill entirely.
         launch_sm100_scan(xpad, kv_cont, (int)n_groups, (int)q_group_size, (int)rows_valid,
                           (int)scan_end, /*start_row=*/0,
                           origin, inv_delta, th, qcount, bcount, buf_val, buf_idx,
                           (int)buf_cap, (int)num_buckets, (int)k, scan_refresh,
                           (int)num_ctas_x, stream, cta_done.data_ptr<int>(),
-                          /*dense_out=*/nullptr, (int)qn, eff_bm, out_fp32, strided_sample);
+                          /*dense_out=*/nullptr, (int)qn, eff_bm, out_fp32,
+                          /*store_bucket_space=*/true);
     }
 
-    // 6) boundary radix select over the compact candidates. buf_val / cand_val /
+    // 4) Boundary radix select over compact candidates. buf_val / cand_val /
     // lt_val / val_pad all hold BUCKET-SPACE coordinates bq = (x-o)*inv end to
     // end (scan stores bq directly, select never reconstructs x — see the
     // scan epilogue and flashtopk_compact_thr_kernel). bq is an affine
     // (order-preserving) transform of x, so every comparison/sort inside the
     // select machinery is unaffected; only the FINAL K outputs per row need
-    // converting back, done ONCE below instead of once per candidate scanned.
+    // converting back below.
     if (out_fp32) {
         launch_flash_topk_select_thr_mb_idx_fp32(
             buf_val.data_ptr<float>(),
@@ -573,19 +509,13 @@ std::tuple<at::Tensor, at::Tensor> fused_ip_sparse_b200(
             lt_idx.data_ptr<int>(), lt_cnt.data_ptr<int>(),
             reinterpret_cast<__half*>(val_pad.data_ptr<at::Half>()),
             idx_pad.data_ptr<int>(), /*coords_fp16=*/false, stream, /*skip_zero=*/0,
-            /*bucket_space=*/strided_sample);
-        // 7) tail-mode (!strided_sample) shares buf_val with the legacy
-        // launch_hopper_seed_from_sample_fp16 seed prefill, which always
-        // writes raw scores -- the scan then also stores raw x (see
-        // store_bucket_space above), so val_pad already holds x and only
-        // needs the sign flip. Strided mode: val_pad holds bq, needs the
-        // full debucket + negate affine (fp32 math, cast back to half).
-        if (strided_sample) {
-            auto delta = inv_delta.reciprocal().unsqueeze(1);
-            val_pad = val_pad.to(at::kFloat).mul(delta).add(origin.unsqueeze(1)).neg_().to(at::kHalf);
-        } else {
-            val_pad = val_pad.neg();
-        }
+            /*bucket_space=*/true);
+        auto delta = inv_delta.reciprocal().unsqueeze(1);
+        val_pad = val_pad.to(at::kFloat)
+                      .mul(delta)
+                      .add(origin.unsqueeze(1))
+                      .neg_()
+                      .to(at::kHalf);
     }
     auto val = val_pad.view({n_groups, qn, k}).slice(1, 0, rows_valid).reshape({Hq, k}).contiguous();
     auto idx = idx_pad.view({n_groups, qn, k}).slice(1, 0, rows_valid).reshape({Hq, k}).contiguous();
@@ -599,7 +529,7 @@ TORCH_LIBRARY(litetopk_sm100, m) {
           "int q_group_size, int logical_rows, int start_row, int num_buckets, int topk, "
           "int refresh_every, int buf_cap, int num_ctas_x=0) -> (Tensor, Tensor, Tensor)");
     m.def("fused_ip_sparse_b200(Tensor x, Tensor kv_cont, int k, int num_buckets, "
-          "int buf_cap, int sample_size, int refresh_every, int num_ctas_x, int sample_mode=0, "
+          "int buf_cap, int sample_size, int refresh_every, int num_ctas_x, int sample_mode=1, "
           "int qn=0, int bm=0, bool out_fp32=False) -> (Tensor, Tensor)");
     m.def("dense_scores(Tensor x, Tensor kv_cont, int num_ctas_x=0) -> Tensor");
 }

@@ -1,8 +1,7 @@
-// LiteTopK DSA V3 host wrapper — H100 (SM90) port of the B200 file.
-// Scoring kernel is sm90_dsa_litetopk.cuh (WGMMA); every other kernel in this
-// file (fused seed/prep, radix selects, refresh) is architecture-agnostic and
-// copied VERBATIM from kernels/b200/dsa/dsa_litetopk.cu. Build against the
-// DeepGEMM 2.5 include tree + its bundled CUTLASS, -arch=sm_90a.
+// PyTorch extension for the H100 LiteTopK DSA indexer. It provides sample
+// calibration, the SM90 WGMMA sparse scan, threshold refresh, and radix-select
+// post-processing. Build against the DeepGEMM 2.5 include tree and its bundled
+// CUTLASS headers for sm_90a.
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
@@ -11,7 +10,9 @@
 #include <cuda_runtime.h>
 #include <dlfcn.h>
 
+#include <atomic>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <tuple>
 
@@ -85,6 +86,34 @@ constexpr int SPEC_THREADS = 128;
 constexpr int MATH_THREADS = 256;  // 2 math warpgroups (each owns one m64 tile)
 constexpr int NUM_SMS = 132;       // H100 SXM
 
+// Cache device-dependent launch properties. The SM count sizes the KV-split
+// grid, and the scan kernel opts into dynamic shared memory once per device.
+constexpr int MAX_TRACKED_CUDA_DEVICES = 64;
+
+static int current_device_sm_count(int device) {
+    TORCH_CHECK(device >= 0 && device < MAX_TRACKED_CUDA_DEVICES,
+                "CUDA device ordinal out of cached range: ", device);
+    static std::atomic<int> counts[MAX_TRACKED_CUDA_DEVICES]{};
+    int count = counts[device].load(std::memory_order_acquire);
+    if (count == 0) {
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(
+            &count, cudaDevAttrMultiProcessorCount, device));
+        counts[device].store(count, std::memory_order_release);
+    }
+    return count;
+}
+
+static void set_scan_smem_attribute_once(
+        const void* kernel, int smem, int device) {
+    TORCH_CHECK(device >= 0 && device < MAX_TRACKED_CUDA_DEVICES,
+                "CUDA device ordinal out of cached range: ", device);
+    static std::once_flag once[MAX_TRACKED_CUDA_DEVICES];
+    std::call_once(once[device], [=] {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    });
+}
+
 __global__ void seed_bcount_kernel(
     const float* __restrict__ seed_val,
     int seed_k,
@@ -129,16 +158,10 @@ __global__ void refresh_threshold_from_bcount_kernel(
     if (found && new_th < old_th) th_bucket[row] = new_th;
 }
 
-// Fused seed/prep kernel (one block per row, all state in smem — borrows the
-// vLLM top_k_per_row engineering): from the sample scores [Q, head] derive the
-// per-row bucket params (origin, inv_delta), the initial gate threshold
-// (bucket of the K-th best sample score), write the FULL sample histogram into
-// bcount (a valid, conservative refresh base: counting genuine row elements
-// can only tighten th safely), and emit every sample position with
-// bucket <= th as initial candidates — a SUPERSET of the sample top-K, which
-// the exact final select trims. Replaces: aminmax + torch.topk/radix seed +
-// neg/contiguous copies + host seed copies + seed_bcount_kernel (~6 passes,
-// ~10 launches) with 3 passes in 1 launch.
+// Fused sample preparation, one block per row. It derives the bucket affine
+// and initial K-th bucket, publishes the sample histogram as a conservative
+// refresh base, and emits every sample position at or above the threshold.
+// Those seeds are a superset of the sample top-K; the final select trims them.
 __global__ void seed_prep_kernel(
     const float* __restrict__ slog, const int64_t slog_stride,
     const int head, const int NB, const int K, const int cap,
@@ -205,7 +228,8 @@ __global__ void seed_prep_kernel(
     __syncthreads();
     float o = -s_mx[0];         // min over x = -score
     const float hi = -s_mn[0];  // max over x
-    const float span = fmaxf(hi - o, 1e-20f);
+    const float mag = fmaxf(fabsf(hi), fabsf(o));
+    const float span = fmaxf(fmaxf(hi - o, mag * 0x1p-8f), 1e-6f);
     o -= headroom * span;       // forward (above-max) drift headroom
     float inv = (NB - 1) / (span * (1.0f + headroom));
 
@@ -241,21 +265,9 @@ __global__ void seed_prep_kernel(
         s_hist[b] = c;
     }
     __syncthreads();
-    // Coarse K-th estimate, then REBUILD the scale over just the useful
-    // range: [~K-th value (+1 coarse bucket slack) .. sample max + drift
-    // headroom]. The bottom of [min,max] is dead weight (the true global
-    // threshold can only be TIGHTER than the sample's), and without top
-    // headroom any score drifting above the sample max clamps into bucket 0
-    // where refresh can never resolve past it (measured @512K/Q8192: 25% of
-    // candidates above sample max, th floored at 0 for 43% of rows, 6.8xK
-    // emission). Fine scale concentrates all NB buckets where the threshold
-    // actually lives.
-    // NOTE (C3, rejected by measurement 2026-07-09): rebuilding a FINE scale
-    // over [K-th edge .. sample max + headroom] (fused into pass 3, no extra
-    // read) did NOT fix the 512K@Q8192 drift shape (headroom proportional to
-    // the narrow fine span is absolutely tiny — drift still clamps to bucket
-    // 0) and cost 3-12% at every healthy shape (finer th moves more often ->
-    // more gate fdiv reloads; extra smem atomic per value in pass 3).
+    // Publish the sample histogram for scan-time threshold refresh. A
+    // calibration-only probe emits no seeds, so its scan-side counts start at
+    // zero and are populated by the full scan.
     for (int b = tid; b < NB; b += BT)
         // Probe mode (emit_limit==0): scan-side refresh must start from zero
         // counts — write zeros here, saving the caller a separate memset.
@@ -300,14 +312,10 @@ __global__ void seed_prep_kernel(
             if (g) {
                 const int pos = base + __popc(m & ((lane == 0) ? 0u : ((1u << lane) - 1u)));
                 if (pos < cap) {
-#ifdef DSA_BUCKET_GATE4
-                    // GATE4 build: candidate values live in BUCKET SPACE
-                    // build-wide (the scan writes bq; select is rebased).
-                    // Seeds must match: (x - o)*inv, same affine as the scan.
+                    // Seeds use the same bucket coordinates as scan candidates:
+                    // bq = (x - o) * inv. Select consumes this representation
+                    // with the identity affine transform.
                     vrow[pos] = (-s - o) * inv;
-#else
-                    vrow[pos] = -s;
-#endif
                     irow[pos] = probe_stride_tok > 0
                         ? (j >> 6) * probe_stride_tok + (j & 63) : j;
                 }
@@ -620,23 +628,14 @@ static int compute_smem_bytes() {
     // warpgroups themselves).
     const int num_barriers = NUM_Q_STAGES * 2 + NUM_KV_STAGES * 2;
     const int smem_barriers = num_barriers * 8;
-#ifdef DSA_PERSIST
-    const int smem_slots = 8 * (int)sizeof(uint32_t);  // + done_qb, ack[2]
-#else
     const int smem_slots = 4 * (int)sizeof(uint32_t);  // tmem ptr + daemon mailboxes
-#endif
     const int smem_warpq = (MATH_THREADS / 32) * BLOCK_Q *
                            ((int)sizeof(int32_t) + DSA_WARP_QUEUE_CAP * ((int)sizeof(float) + (int)sizeof(int32_t)));
     const int smem_hist = BLOCK_Q * 256 * (int)sizeof(int32_t);  // per-CTA refresh
                                                                   // histogram (NB<=256)
-#ifdef DSA_HIST_DEFER
-    const int smem_safe = BLOCK_Q * (int)sizeof(int32_t);  // deferred-feed watermark
-#else
-    const int smem_safe = 0;
-#endif
     return NUM_Q_STAGES * smem_q + NUM_Q_STAGES * smem_w +
            NUM_KV_STAGES * smem_kv + NUM_KV_STAGES * smem_ks +
-           smem_barriers + smem_slots + smem_warpq + smem_hist + smem_safe;
+           smem_barriers + smem_slots + smem_warpq + smem_hist;
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk(
@@ -729,9 +728,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk(
     auto kernel = &dsa_litetopk::sm90_dsa_litetopk<
         NUM_HEADS, HEAD_DIM, BLOCK_Q, BLOCK_KV, NUM_Q_STAGES, NUM_KV_STAGES,
         NUM_SMS, SPEC_THREADS, MATH_THREADS>;
-    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    const int device = q.get_device();
+    set_scan_smem_attribute_once((const void*)kernel, smem, device);
 
-    // V1 KV-split grid: x = q-blocks, y = KV splits (~4 CTA waves per SM).
+    // KV-split grid: x indexes query blocks and y indexes contiguous KV
+    // windows. The split count is sized from the active device.
     const int num_q_blocks = (seq_len + BLOCK_Q - 1) / BLOCK_Q;
     const int total_kv_blocks = (seq_len_kv + BLOCK_KV - 1) / BLOCK_KV;
     int num_kv_splits;
@@ -740,7 +741,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk(
     } else {
         constexpr int kWaves = 4;
         const int qb = num_q_blocks > 0 ? num_q_blocks : 1;
-        num_kv_splits = (kWaves * NUM_SMS + qb - 1) / qb;
+        num_kv_splits =
+            (kWaves * current_device_sm_count(device) + qb - 1) / qb;
         const int max_useful_splits = total_kv_blocks > 0 ? (total_kv_blocks + 1) / 2 : 1;
         if (num_kv_splits > max_useful_splits) num_kv_splits = max_useful_splits;
     }
@@ -932,7 +934,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk_
     auto kernel = &dsa_litetopk::sm90_dsa_litetopk<
         NUM_HEADS, HEAD_DIM, BLOCK_Q, BLOCK_KV, NUM_Q_STAGES, NUM_KV_STAGES,
         NUM_SMS, SPEC_THREADS, MATH_THREADS>;
-    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    const int device = q.get_device();
+    set_scan_smem_attribute_once((const void*)kernel, smem, device);
 
     const int num_q_blocks = (seq_len + BLOCK_Q - 1) / BLOCK_Q;
     const int total_kv_blocks = (seq_len_kv + BLOCK_KV - 1) / BLOCK_KV;
@@ -942,19 +945,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk_
     } else {
         constexpr int kWaves = 4;
         const int qb = num_q_blocks > 0 ? num_q_blocks : 1;
-        num_kv_splits = (kWaves * NUM_SMS + qb - 1) / qb;
+        num_kv_splits =
+            (kWaves * current_device_sm_count(device) + qb - 1) / qb;
         const int max_useful_splits = total_kv_blocks > 0 ? (total_kv_blocks + 1) / 2 : 1;
         if (num_kv_splits > max_useful_splits) num_kv_splits = max_useful_splits;
     }
     if (num_kv_splits < 1) num_kv_splits = 1;
     if (num_kv_splits > total_kv_blocks) num_kv_splits = total_kv_blocks > 0 ? total_kv_blocks : 1;
     int grid_q = num_q_blocks;
-#ifdef DSA_PERSIST
-    // persistent scheduling for the merge path: one CTA per SM loops
-    // q-blocks (static stride).
-    if (num_kv_splits == 1 && num_q_blocks > NUM_SMS)
-        grid_q = NUM_SMS;
-#endif
     dim3 grid((unsigned)grid_q, (unsigned)num_kv_splits, 1);
     kernel<<<grid, SPEC_THREADS + MATH_THREADS, smem, stream>>>(
         (uint32_t)seq_len, (uint32_t)seq_len_kv,
@@ -1015,7 +1013,9 @@ std::tuple<torch::Tensor, torch::Tensor> compact_topk_min_thr_litetopk(
         int64_t k64,
         int64_t probe_group64,
         int64_t probe_add_max64,
-        std::optional<torch::Tensor> seed_base) {
+        std::optional<torch::Tensor> seed_base,
+        std::optional<torch::Tensor> out_val_buf,
+        std::optional<torch::Tensor> out_idx_buf) {
     TORCH_CHECK(cand_val.is_cuda() && cand_idx.is_cuda() && cand_cnt.is_cuda() &&
                 origin.is_cuda() && inv_delta.is_cuda() && th_bucket.is_cuda(), "tensors must be CUDA");
     TORCH_CHECK(cand_val.is_contiguous() && cand_idx.is_contiguous() && cand_cnt.is_contiguous() &&
@@ -1034,8 +1034,26 @@ std::tuple<torch::Tensor, torch::Tensor> compact_topk_min_thr_litetopk(
     TORCH_CHECK(NB >= 2 && NB <= 4096, "num_buckets out of range");
     TORCH_CHECK(origin.numel() == R && inv_delta.numel() == R && th_bucket.numel() == R,
                 "origin/inv_delta/th_bucket must have R elements");
-    auto out_val = torch::empty({R, K}, cand_val.options());
-    auto out_idx = torch::empty({R, K}, cand_idx.options());
+    auto out_val = out_val_buf.has_value()
+                       ? out_val_buf.value()
+                       : torch::empty({R, K}, cand_val.options());
+    auto out_idx = out_idx_buf.has_value()
+                       ? out_idx_buf.value()
+                       : torch::empty({R, K}, cand_idx.options());
+    TORCH_CHECK(out_val.is_cuda() && out_idx.is_cuda(),
+                "select outputs must be CUDA");
+    TORCH_CHECK(out_val.is_contiguous() && out_idx.is_contiguous(),
+                "select outputs must be contiguous");
+    TORCH_CHECK(out_val.scalar_type() == torch::kFloat &&
+                out_idx.scalar_type() == torch::kInt,
+                "select outputs must be fp32/int32");
+    TORCH_CHECK(out_val.dim() == 2 && out_idx.dim() == 2 &&
+                out_val.size(0) == R && out_val.size(1) == K &&
+                out_idx.size(0) == R && out_idx.size(1) == K,
+                "select outputs must be [R, topk]");
+    TORCH_CHECK(out_val.get_device() == cand_val.get_device() &&
+                out_idx.get_device() == cand_val.get_device(),
+                "select outputs must be on the candidate device");
     if (probe_group64 > 0) {
         TORCH_CHECK(seed_base.has_value() && seed_base->is_cuda() &&
                     seed_base->is_contiguous() &&
@@ -1074,7 +1092,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("probe_stride_tok") = 0,
           pybind11::arg("hist_stride") = 1);
     m.def("mqa_logits_dsa_litetopk_ext", &mqa_logits_dsa_litetopk_ext,
-          "V3 scan into buffers prepared by seed_prep_litetopk",
+          "Sparse scan into buffers prepared by seed_prep_litetopk",
           pybind11::arg("q"), pybind11::arg("kv"), pybind11::arg("kv_scales"),
           pybind11::arg("weights"), pybind11::arg("cu_start"), pybind11::arg("cu_end"),
           pybind11::arg("origin"), pybind11::arg("inv_delta"), pybind11::arg("th_bucket"),
@@ -1083,7 +1101,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("refresh_every"), pybind11::arg("num_kv_splits")=-1,
           pybind11::arg("probe_group")=0, pybind11::arg("probe_add_max")=0);
     m.def("mqa_logits_dsa_litetopk", &mqa_logits_dsa_litetopk,
-          "DSA ReLU-MQA scoring V3 hybrid (DeepGEMM-2.5 loop + V1 KV-split) with sparse epilogue",
+          "Fused DSA ReLU-MQA scan with sparse candidate emission",
           pybind11::arg("q"), pybind11::arg("kv"), pybind11::arg("kv_scales"),
           pybind11::arg("weights"), pybind11::arg("cu_start"), pybind11::arg("cu_end"),
           pybind11::arg("origin"), pybind11::arg("inv_delta"), pybind11::arg("th_bucket"),
@@ -1098,5 +1116,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("origin"), pybind11::arg("inv_delta"), pybind11::arg("th_bucket"),
           pybind11::arg("num_buckets"), pybind11::arg("topk"),
           pybind11::arg("probe_group") = 0, pybind11::arg("probe_add_max") = 0,
-          pybind11::arg("seed_base") = pybind11::none());
+          pybind11::arg("seed_base") = pybind11::none(),
+          pybind11::arg("out_val") = pybind11::none(),
+          pybind11::arg("out_idx") = pybind11::none());
 }

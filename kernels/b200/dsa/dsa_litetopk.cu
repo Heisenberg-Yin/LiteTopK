@@ -19,6 +19,40 @@
 
 namespace {
 
+using CandidateValue = dsa_litetopk::CandidateValue;
+
+static torch::TensorOptions candidate_options(
+        const torch::TensorOptions& options) {
+#ifdef DSA_CANDIDATE_U16
+    // torch.float16 is only the owning 16-bit storage type here.  CUDA treats
+    // its payload as an opaque uint16 score code; no half arithmetic occurs.
+    return options.dtype(torch::kHalf);
+#else
+    return options.dtype(torch::kFloat);
+#endif
+}
+
+static CandidateValue* candidate_data_ptr(torch::Tensor& tensor) {
+#ifdef DSA_CANDIDATE_U16
+    return reinterpret_cast<CandidateValue*>(
+        tensor.data_ptr<at::Half>());
+#else
+    return tensor.data_ptr<float>();
+#endif
+}
+
+static void check_candidate_dtype(const torch::Tensor& tensor) {
+#ifdef DSA_CANDIDATE_U16
+    TORCH_CHECK(
+        tensor.scalar_type() == torch::kHalf,
+        "DSA_CANDIDATE_U16 cand_val storage must be float16");
+#else
+    TORCH_CHECK(
+        tensor.scalar_type() == torch::kFloat,
+        "cand_val must be fp32");
+#endif
+}
+
 static void* driver_handle() {
     static void* h = nullptr;
     if (!h) {
@@ -159,7 +193,8 @@ __global__ void seed_prep_kernel(
     float* __restrict__ origin, float* __restrict__ inv_delta,
     int32_t* __restrict__ th_bucket,
     int32_t* __restrict__ bcount,
-    float* __restrict__ cand_val, int32_t* __restrict__ cand_idx,
+    CandidateValue* __restrict__ cand_val,
+    int32_t* __restrict__ cand_idx,
     int32_t* __restrict__ cand_cnt) {
     constexpr int BT = 1024;
     constexpr int NSUB = 4;  // sub-histograms to spread smem atomic conflicts
@@ -243,23 +278,20 @@ __global__ void seed_prep_kernel(
     __syncthreads();
     // Coarse K-th estimate, then REBUILD the scale over just the useful
     // range: [~K-th value (+1 coarse bucket slack) .. sample max + drift
-    // headroom]. The bottom of [min,max] is dead weight (the true global
-    // threshold can only be TIGHTER than the sample's), and without top
-    // headroom any score drifting above the sample max clamps into bucket 0
-    // where refresh can never resolve past it (measured @512K/Q8192: 25% of
-    // candidates above sample max, th floored at 0 for 43% of rows, 6.8xK
-    // emission). Fine scale concentrates all NB buckets where the threshold
-    // actually lives.
-    // NOTE (C3, rejected by measurement 2026-07-09): rebuilding a FINE scale
-    // over [K-th edge .. sample max + headroom] (fused into pass 3, no extra
-    // read) did NOT fix the 512K@Q8192 drift shape (headroom proportional to
-    // the narrow fine span is absolutely tiny — drift still clamps to bucket
-    // 0) and cost 3-12% at every healthy shape (finer th moves more often ->
-    // more gate fdiv reloads; extra smem atomic per value in pass 3).
-    for (int b = tid; b < NB; b += BT)
-        // Probe mode (emit_limit==0): scan-side refresh must start from zero
-        // counts — write zeros here, saving the caller a separate memset.
-        bcount[(size_t)row * NB + b] = (emit_limit == 0) ? 0 : s_hist[b];
+    // headroom]. The bottom of [min,max] cannot contain the final threshold,
+    // while headroom prevents scores above the sample maximum from collapsing
+    // into bucket 0. The resulting scale concentrates bins around the useful
+    // threshold range.
+#ifdef DSA_SPARSE_REFRESH_ZERO_BASE
+    // The production U16 contract uses emit_limit==0 and a single KV split.
+    // Its scan covers the complete KV range and initializes the CTA-local
+    // histogram itself, so writing Q*NB zeros to global memory is dead work.
+    if (emit_limit != 0)
+#endif
+        for (int b = tid; b < NB; b += BT)
+            // Probe mode (emit_limit==0): scan-side refresh starts from zero.
+            bcount[(size_t)row * NB + b] =
+                (emit_limit == 0) ? 0 : s_hist[b];
     __shared__ int s_th;
     if (tid == 0) {
         const int kk = K < head ? K : head;
@@ -287,7 +319,7 @@ __global__ void seed_prep_kernel(
     __shared__ int s_cnt;
     if (tid == 0) s_cnt = 0;
     __syncthreads();
-    float* vrow = cand_val + (size_t)row * cap;
+    CandidateValue* vrow = cand_val + (size_t)row * cap;
     int32_t* irow = cand_idx + (size_t)row * cap;
     const auto emit_group = [&](const float s, const int j) {
         const int b_of = (isfinite(s) && j < emit_limit) ? bucket_of(s) : NB;
@@ -304,9 +336,10 @@ __global__ void seed_prep_kernel(
                     // GATE4 build: candidate values live in BUCKET SPACE
                     // build-wide (the scan writes bq; select is rebased).
                     // Seeds must match: (x - o)*inv, same affine as the scan.
-                    vrow[pos] = (-s - o) * inv;
+                    vrow[pos] = static_cast<CandidateValue>(
+                        (-s - o) * inv);
 #else
-                    vrow[pos] = -s;
+                    vrow[pos] = static_cast<CandidateValue>(-s);
 #endif
                     irow[pos] = probe_stride_tok > 0
                         ? (j >> 6) * probe_stride_tok + (j & 63) : j;
@@ -340,6 +373,121 @@ __device__ __forceinline__ uint32_t compact_enc_float(float v) {
     uint32_t bits = __float_as_uint(v);
     return (bits & 0x80000000u) ? (~bits) : (bits ^ 0x80000000u);
 }
+
+#ifdef DSA_CHUNKED_EMIT
+__global__ void compact_chunked_emit_kernel(
+    const uint64_t* __restrict__ workspace,
+    CandidateValue* __restrict__ cand_val,
+    int32_t* __restrict__ cand_idx,
+    int32_t* __restrict__ cand_cnt,
+    int rows,
+    int cap,
+    int num_kv_splits,
+    int chunks_per_split,
+    uint32_t probe_group,
+    uint64_t probe_magic,
+    uint32_t probe_add_max) {
+    constexpr int kMathWarps = MATH_THREADS / 32;
+    const int qblock = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int source_warp = tid >> 5;
+    const int lane = tid & 31;
+    const int num_q_blocks = (rows + BLOCK_Q - 1) / BLOCK_Q;
+    if (qblock >= num_q_blocks) return;
+
+    const uint64_t num_chunks =
+        static_cast<uint64_t>(num_q_blocks) * num_kv_splits *
+        chunks_per_split * kMathWarps;
+    const uint64_t record_count =
+        num_chunks * BLOCK_Q * DSA_EMIT_LANE_SLOTS * 32u;
+    const uint32_t* counts =
+        reinterpret_cast<const uint32_t*>(workspace + record_count);
+
+    __shared__ int cursor[BLOCK_Q];
+    if (tid < BLOCK_Q) {
+        const int row = qblock * BLOCK_Q + tid;
+        cursor[tid] = row < rows ? cand_cnt[row] : 0;
+    }
+    __syncthreads();
+
+    for (int split = 0; split < num_kv_splits; ++ split) {
+        for (int chunk = 0; chunk < chunks_per_split; ++ chunk) {
+            const uint64_t chunk_linear =
+                ((static_cast<uint64_t>(qblock) * num_kv_splits + split) *
+                     chunks_per_split +
+                 chunk) *
+                    kMathWarps +
+                source_warp;
+            const uint32_t packed =
+                counts[chunk_linear * 32u + lane];
+            const uint64_t record_base =
+                chunk_linear * (BLOCK_Q * DSA_EMIT_LANE_SLOTS * 32u);
+
+            #pragma unroll
+            for (int i = 0; i < BLOCK_Q; ++ i) {
+                const int row = qblock * BLOCK_Q + i;
+                if (row >= rows) continue;
+                const uint32_t count = (packed >> (i * 8)) & 0xffu;
+                const uint32_t total =
+                    __reduce_add_sync(0xffffffffu, count);
+                if (total == 0) continue;
+
+                uint32_t offset = count;
+                #pragma unroll
+                for (int delta = 1; delta < 32; delta <<= 1) {
+                    const uint32_t other =
+                        __shfl_up_sync(0xffffffffu, offset, delta);
+                    if (lane >= delta) offset += other;
+                }
+                offset -= count;
+
+                int out_base = 0;
+                if (lane == 0)
+                    out_base = atomicAdd(cursor + i,
+                                         static_cast<int>(total));
+                out_base =
+                    __shfl_sync(0xffffffffu, out_base, 0);
+                const int copy_count = min(
+                    static_cast<int>(count),
+                    max(cap - out_base - static_cast<int>(offset), 0));
+                for (int slot = 0; slot < copy_count; ++ slot) {
+                    const uint64_t record =
+                        workspace[
+                            record_base +
+                            (i * DSA_EMIT_LANE_SLOTS + slot) * 32u +
+                            lane];
+                    const int out =
+                        out_base + static_cast<int>(offset) + slot;
+                    const uint64_t out_pos =
+                        static_cast<uint64_t>(row) * cap + out;
+                    const uint32_t record_payload =
+                        static_cast<uint32_t>(record);
+                    uint32_t kvo = static_cast<uint32_t>(record >> 32);
+                    if (probe_group != 0) {
+                        const uint32_t sup =
+                            static_cast<uint32_t>(
+                                (static_cast<uint64_t>(kvo) *
+                                 probe_magic) >>
+                                42);
+                        kvo += min((sup + 1) * 64u, probe_add_max);
+                    }
+                    DSA_ST_CANDIDATE_RECORD(
+                        cand_val[out_pos],
+                        cand_idx[out_pos],
+                        record_payload,
+                        kvo);
+                }
+            }
+        }
+    }
+
+    __syncthreads();
+    if (tid < BLOCK_Q) {
+        const int row = qblock * BLOCK_Q + tid;
+        if (row < rows) cand_cnt[row] = cursor[tid];
+    }
+}
+#endif
 
 __global__ void compact_topk_min_idx_litetopk_kernel(
     const float* __restrict__ val,
@@ -610,6 +758,687 @@ __global__ void compact_topk_min_thr_litetopk_kernel(
     }
 }
 
+#ifdef DSA_INPLACE_BOUNDARY_SELECT
+// DSA specialization of the GitHub FlashTopK boundary-bucket strategy.
+//
+// The generic selector above logically restricts the radix set to bucket
+// `th`, but every radix pass still rereads all `n` candidates and filters
+// them. Sparse refresh normally leaves:
+//
+//     count(bucket < th) < K <= count(bucket <= th).
+//
+// Make that saving physical: one tiled pass writes bucket<th directly to the
+// final output and compacts bucket==th in-place at the front of the candidate
+// buffer. The four radix passes then read only that compact boundary. A tile
+// is loaded completely before any write, and the compacted prefix can never
+// extend beyond the end of the processed tile, so aliasing input/output is
+// race-free and needs no second multi-GiB candidate slab.
+//
+// The two fallback modes mirror compact_topk_min_thr_litetopk_kernel:
+//   * threshold too loose (lt >= K): compact/radix the lt set;
+//   * threshold underfilled: compact/radix every finite buffered candidate.
+__global__ void compact_topk_min_thr_inplace_idx_out_litetopk_kernel(
+    CandidateValue* __restrict__ val,
+    int32_t* __restrict__ idx,
+    const int32_t* __restrict__ cnt,
+    const int32_t* __restrict__ th_in,
+    const int32_t* __restrict__ boundary_meta,
+    int R,
+    int CAP,
+    int K,
+    int NB,
+    int32_t* __restrict__ out_idx) {
+    constexpr int BT = 256;
+    constexpr int RADIX = 256;
+    const unsigned FULL = 0xffffffffu;
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const unsigned lane_mask =
+        lane == 0 ? 0u : ((1u << lane) - 1u);
+    if (row >= R) return;
+
+    CandidateValue* vrow =
+        val + static_cast<size_t>(row) * CAP;
+    int32_t* irow = idx + static_cast<size_t>(row) * CAP;
+    int32_t* oi = out_idx + static_cast<size_t>(row) * K;
+    const int raw_n = cnt[row];
+    int n = raw_n;
+    if (n > CAP) n = CAP;
+    if (n < 0) n = 0;
+    if (n == 0) {
+        for (int j = tid; j < K; j += BT) {
+            oi[j] = 0;
+        }
+        return;
+    }
+
+    const int th = th_in[row];
+#if defined(DSA_CANDIDATE_U16) && \
+    !defined(DSA_CANDIDATE_U16_BUCKET8_FRAC8)
+    // The packed boundary remains bit-exact only above its compile-time
+    // lower bound.  Fail loudly instead of silently turning the exact path
+    // into an approximation.
+#ifdef DSA_CANDIDATE_U16_BUCKET_RESIDUAL
+    constexpr int kPackedExactThreshold = 8;
+#else
+    constexpr int kPackedExactThreshold = 1;
+#endif
+    if (th < kPackedExactThreshold) {
+        asm volatile("trap;");
+        return;
+    }
+#endif
+
+    // mode 0: standard boundary path; 1: loose threshold; 2: underfilled.
+    __shared__ int s_count_lt;
+    __shared__ int s_count_eq;
+    __shared__ int s_count_valid;
+    __shared__ int s_have_boundary_meta;
+    __shared__ int s_mode;
+    __shared__ int s_k_target;
+    constexpr int BOUNDARY_SMEM_CAP = 256;
+#ifdef DSA_CANDIDATE_U16
+    __shared__ uint32_t s_boundary_val[BOUNDARY_SMEM_CAP];
+#else
+    __shared__ float s_boundary_val[BOUNDARY_SMEM_CAP];
+#endif
+    __shared__ int32_t s_boundary_idx[BOUNDARY_SMEM_CAP];
+    __shared__ int s_fast_lt_cursor;
+    __shared__ int s_fast_eq_cursor;
+    __shared__ uint32_t s_fast_hist[RADIX];
+    __shared__ uint32_t s_fast_desired;
+    __shared__ uint32_t s_fast_kfind;
+    __shared__ int s_fast_pivot_lt;
+    __shared__ int s_fast_write_lt;
+    __shared__ int s_fast_write_eq;
+    if (tid == 0) {
+        const int32_t* meta =
+            boundary_meta + static_cast<size_t>(row) * NB;
+        const int tag = meta[0];
+        const int meta_th = ~tag;
+        const int meta_lt = meta[1];
+        const int meta_eq = meta[2];
+        const int meta_need = K - meta_lt;
+        s_have_boundary_meta =
+            tag < 0 && meta_th == th &&
+            meta_th >= 0 && meta_th < NB &&
+            raw_n >= 0 && raw_n <= CAP &&
+            meta_lt >= 0 && meta_eq >= 0 &&
+            meta_lt < K && meta_need > 0 &&
+            meta_need <= meta_eq &&
+            meta_lt + meta_eq <= n;
+        s_count_lt = s_have_boundary_meta ? meta_lt : 0;
+        s_count_eq = s_have_boundary_meta ? meta_eq : 0;
+        s_count_valid = 0;
+    }
+    __syncthreads();
+
+#ifdef DSA_CANDIDATE_U16
+    // The six-byte representation is conditionally exact for the certified
+    // sparse-refresh boundary path.  A missing certificate could require a
+    // top-K selection within collapsed bucket 0, so it is an explicit error.
+    if (!s_have_boundary_meta) {
+        asm volatile("trap;");
+        return;
+    }
+#endif
+
+    if (!s_have_boundary_meta) {
+        int local_lt = 0;
+        int local_eq = 0;
+        int local_valid = 0;
+        for (int j = tid; j < n; j += BT) {
+            const float v =
+                dsa_litetopk::candidate_decode_score(
+                    vrow[j], irow[j]);
+            if (!isfinite(v)) continue;
+            ++local_valid;
+            int braw = static_cast<int>(v);
+            const int b =
+                braw < 0 ? 0 :
+                (braw > NB - 1 ? NB - 1 : braw);
+            local_lt += b < th;
+            local_eq += b == th;
+        }
+        atomicAdd(&s_count_lt, local_lt);
+        atomicAdd(&s_count_eq, local_eq);
+        atomicAdd(&s_count_valid, local_valid);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const int need = K - s_count_lt;
+        if (s_count_lt < K &&
+            need > 0 && need <= s_count_eq) {
+            s_mode = 0;
+            s_k_target = need;
+        } else if (s_count_lt >= K) {
+            s_mode = 1;
+            s_k_target = K;
+        } else {
+            s_mode = 2;
+            s_k_target = min(K, s_count_valid);
+        }
+    }
+    __syncthreads();
+
+    // Production sparse-refresh distribution (Q=8192, K=2048):
+    // boundary E averages ~97 candidates, P99 ~163, max 212 on the 1M
+    // corpus. Keep that boundary entirely in shared memory. Unlike the
+    // generic in-place path below, this pass has no aliasing stores, so
+    // warp-local shared-atomic reservations need no CTA barrier per tile.
+    if (s_have_boundary_meta &&
+        s_count_eq <= BOUNDARY_SMEM_CAP) {
+        if (tid == 0) {
+            s_fast_lt_cursor = 0;
+            s_fast_eq_cursor = 0;
+        }
+        __syncthreads();
+        for (int tile = 0; tile < n; tile += BT) {
+            const int j = tile + tid;
+#ifdef DSA_CANDIDATE_U16
+            uint32_t score_code = 0u;
+            bool valid = false;
+#ifdef DSA_CANDIDATE_U16_BUCKET8_FRAC8
+            uint32_t bucket = 0u;
+            if (j < n) {
+                score_code =
+                    static_cast<uint32_t>(vrow[j]);
+                bucket = score_code >> 8;
+                valid = true;
+            }
+            const bool is_lt =
+                valid && bucket < static_cast<uint32_t>(th);
+            const bool is_eq =
+                valid && bucket == static_cast<uint32_t>(th);
+#elif defined(DSA_CANDIDATE_FP16_NUMERIC)
+            uint32_t bucket = 0u;
+            if (j < n) {
+                score_code =
+                    static_cast<uint32_t>(vrow[j]);
+                bucket =
+                    dsa_litetopk::candidate_load_bucket(
+                        irow[j]);
+                valid = true;
+            }
+            const bool is_lt =
+                valid && bucket < static_cast<uint32_t>(th);
+            const bool is_eq =
+                valid && bucket == static_cast<uint32_t>(th);
+#elif defined(DSA_CANDIDATE_U16_BUCKET_RESIDUAL)
+            uint32_t bucket = 0u;
+            if (j < n) {
+                score_code =
+                    dsa_litetopk::candidate_load_residual(
+                        vrow[j], irow[j]);
+                bucket =
+                    dsa_litetopk::candidate_load_bucket(
+                        irow[j]);
+                valid = true;
+            }
+            const bool is_lt =
+                valid && bucket < static_cast<uint32_t>(th);
+            const bool is_eq =
+                valid && bucket == static_cast<uint32_t>(th);
+#else
+            if (j < n) {
+                score_code =
+                    dsa_litetopk::candidate_load_score_code(
+                        vrow[j], irow[j]);
+                valid = score_code != 0u;
+            }
+            const uint32_t th_code =
+                dsa_litetopk::candidate_score_code(
+                    static_cast<float>(th));
+            const uint32_t next_th_code =
+                dsa_litetopk::candidate_score_code(
+                    static_cast<float>(th + 1));
+            const bool is_lt =
+                valid && score_code < th_code;
+            const bool is_eq =
+                valid && score_code >= th_code &&
+                score_code < next_th_code;
+#endif
+#else
+            float v = INFINITY;
+            int b = NB;
+            bool valid = false;
+            if (j < n) {
+                v = dsa_litetopk::candidate_decode_score(
+                    vrow[j], irow[j]);
+                valid = isfinite(v);
+#ifndef DSA_BOUNDARY_FLOAT_CLASSIFY
+                if (valid) {
+                    int braw = static_cast<int>(v);
+                    b = braw < 0 ? 0 :
+                        (braw > NB - 1 ? NB - 1 : braw);
+                }
+#endif
+            }
+#ifdef DSA_BOUNDARY_FLOAT_CLASSIFY
+            // Gate4 candidates are already in bucket space. For an interior
+            // integer threshold, clamp(int(v), 0, NB-1) < th is exactly
+            // v < th, and equality is the half-open interval [th, th+1).
+            // The two edge buckets absorb the clamped tails.
+            const float th_lo = static_cast<float>(th);
+            const bool is_lt =
+                valid && th > 0 && v < th_lo;
+            const bool is_eq =
+                valid &&
+                (th == 0
+                     ? v < 1.0f
+                     : (th == NB - 1
+                            ? v >= th_lo
+                            : (v >= th_lo && v < th_lo + 1.0f)));
+#else
+            const bool is_lt = valid && b < th;
+            const bool is_eq = valid && b == th;
+#endif
+#endif
+            const unsigned lt_mask =
+                __ballot_sync(FULL, is_lt);
+            const unsigned eq_mask =
+                __ballot_sync(FULL, is_eq);
+            int warp_lt_base = 0;
+            int warp_eq_base = 0;
+            if (lane == 0) {
+                const int lt_count = __popc(lt_mask);
+                const int eq_count = __popc(eq_mask);
+                if (lt_count != 0)
+                    warp_lt_base =
+                        atomicAdd(&s_fast_lt_cursor, lt_count);
+                if (eq_count != 0)
+                    warp_eq_base =
+                        atomicAdd(&s_fast_eq_cursor, eq_count);
+            }
+            warp_lt_base =
+                __shfl_sync(FULL, warp_lt_base, 0);
+            warp_eq_base =
+                __shfl_sync(FULL, warp_eq_base, 0);
+
+            if (is_lt) {
+                const int pos =
+                    warp_lt_base + __popc(lt_mask & lane_mask);
+                if (pos < K) {
+                    const int32_t raw_idx = irow[j];
+                    oi[pos] =
+                        dsa_litetopk::candidate_decode_index(
+                            raw_idx);
+                }
+            }
+            if (is_eq) {
+                const int pos =
+                    warp_eq_base + __popc(eq_mask & lane_mask);
+                if (pos < BOUNDARY_SMEM_CAP) {
+#ifdef DSA_CANDIDATE_U16
+#ifdef DSA_CANDIDATE_U16_BUCKET8_FRAC8
+                    s_boundary_val[pos] = score_code & 0xffu;
+#else
+                    s_boundary_val[pos] = score_code;
+#endif
+#else
+                    s_boundary_val[pos] = v;
+#endif
+                    s_boundary_idx[pos] =
+                        dsa_litetopk::candidate_decode_index(
+                            irow[j]);
+                }
+            }
+        }
+        __syncthreads();
+
+        const int boundary_n = s_fast_eq_cursor;
+        const int output_base = s_fast_lt_cursor;
+        const int k_target = K - output_base;
+            if (boundary_n == k_target) {
+                for (int j = tid;
+                     j < boundary_n; j += BT) {
+                    oi[output_base + j] = s_boundary_idx[j];
+                }
+                return;
+            }
+
+            if (tid == 0) {
+#if defined(DSA_CANDIDATE_U16) && \
+    !defined(DSA_CANDIDATE_U16_BUCKET_RESIDUAL) && \
+    !defined(DSA_CANDIDATE_U16_BUCKET8_FRAC8) && \
+    !defined(DSA_CANDIDATE_FP16_NUMERIC)
+                s_fast_desired =
+                    s_boundary_val[0] & 0xff000000u;
+#else
+                s_fast_desired = 0u;
+#endif
+                s_fast_kfind =
+                    static_cast<uint32_t>(k_target);
+            }
+            __syncthreads();
+            uint32_t fast_mask = 0u;
+            #pragma unroll
+#ifdef DSA_CANDIDATE_U16_BUCKET8_FRAC8
+            // The boundary bucket is fixed; the low byte is its quantized
+            // fractional rank, so one radix pass is sufficient.
+            for (int pass = 0; pass < 1; ++ pass) {
+                const int shift = 0;
+#elif defined(DSA_CANDIDATE_FP16_NUMERIC)
+            // Positive IEEE FP16 bit patterns are monotonic. Two byte-wise
+            // passes select exactly within the rounded FP16 boundary values.
+            for (int pass = 0; pass < 2; ++ pass) {
+                const int shift = 8 - pass * 8;
+#elif defined(DSA_CANDIDATE_U16)
+            // Every value is in one integer bucket. That interval spans at
+            // most 23 varying FP32 mantissa bits. Select on those three bytes.
+            for (int pass = 0; pass < 3; ++ pass) {
+                const int shift = 16 - pass * 8;
+#else
+            for (int pass = 0; pass < 4; ++ pass) {
+                const int shift = 24 - pass * 8;
+#endif
+                s_fast_hist[tid] = 0;
+                __syncthreads();
+                const uint32_t desired = s_fast_desired;
+                if (tid < boundary_n) {
+#ifdef DSA_CANDIDATE_U16
+                    const uint32_t encoded =
+                        s_boundary_val[tid];
+#else
+                    const uint32_t encoded =
+                        compact_enc_float(s_boundary_val[tid]);
+#endif
+                    if ((encoded & fast_mask) ==
+                        (desired & fast_mask)) {
+                        atomicAdd(
+                            &s_fast_hist[
+                                (encoded >> shift) & 0xffu],
+                            1u);
+                    }
+                }
+                __syncthreads();
+                if (tid == 0) {
+                    uint32_t acc = 0;
+                    const uint32_t kfind = s_fast_kfind;
+                    for (int digit = 0;
+                         digit < RADIX; ++ digit) {
+                        const uint32_t count =
+                            s_fast_hist[digit];
+                        if (acc < kfind &&
+                            kfind <= acc + count) {
+                            s_fast_desired =
+                                desired |
+                                (static_cast<uint32_t>(digit)
+                                 << shift);
+                            s_fast_kfind = kfind - acc;
+                            break;
+                        }
+                        acc += count;
+                    }
+                }
+                __syncthreads();
+                fast_mask |= 0xffu << shift;
+            }
+            const uint32_t pivot = s_fast_desired;
+
+            if (tid == 0) {
+                s_fast_pivot_lt = 0;
+                s_fast_write_lt = 0;
+                s_fast_write_eq = 0;
+            }
+            __syncthreads();
+            if (tid < boundary_n &&
+#ifdef DSA_CANDIDATE_U16
+                s_boundary_val[tid] < pivot)
+#else
+                compact_enc_float(s_boundary_val[tid]) < pivot)
+#endif
+                atomicAdd(&s_fast_pivot_lt, 1);
+            __syncthreads();
+            const int eq_take =
+                max(k_target - s_fast_pivot_lt, 0);
+            if (tid < boundary_n) {
+#ifdef DSA_CANDIDATE_U16
+                const uint32_t encoded =
+                    s_boundary_val[tid];
+#else
+                const float v = s_boundary_val[tid];
+                const uint32_t encoded =
+                    compact_enc_float(v);
+#endif
+                if (encoded < pivot) {
+                    const int pos = atomicAdd(
+                        &s_fast_write_lt, 1);
+                    if (pos < k_target) {
+                        oi[output_base + pos] =
+                            s_boundary_idx[tid];
+                    }
+                } else if (encoded == pivot) {
+                    const int equal_rank = atomicAdd(
+                        &s_fast_write_eq, 1);
+                    if (equal_rank < eq_take) {
+                        const int pos =
+                            output_base +
+                            s_fast_pivot_lt +
+                            equal_rank;
+                        if (pos < K) {
+                            oi[pos] = s_boundary_idx[tid];
+                        }
+                    }
+                }
+            }
+            return;
+    }
+
+    // Tiled, alias-safe in-place compaction. In the standard mode, lt
+    // candidates bypass the compact buffer and go straight to output.
+    __shared__ int s_compact_base;
+    __shared__ int s_direct_base;
+    if (tid == 0) {
+        s_compact_base = 0;
+        s_direct_base = 0;
+    }
+    __syncthreads();
+
+    for (int tile = 0; tile < n; tile += BT) {
+        const int j = tile + tid;
+        CandidateValue raw_value{};
+        float v = INFINITY;
+        int32_t raw_idx = 0;
+        int b = NB;
+        bool valid = false;
+        if (j < n) {
+            raw_value = vrow[j];
+            raw_idx = irow[j];
+            v = dsa_litetopk::candidate_decode_score(
+                raw_value, raw_idx);
+            valid = isfinite(v);
+            if (valid) {
+#ifdef DSA_CANDIDATE_FP16_NUMERIC
+                // FP16 is used only to rank candidates inside the final
+                // bucket. Classification must use the exact FP32 source
+                // bucket packed by the scan, including this cold E>256
+                // fallback path.
+                b = min(
+                    static_cast<int>(
+                        dsa_litetopk::candidate_load_bucket(raw_idx)),
+                    NB - 1);
+#else
+                int braw = static_cast<int>(v);
+                b = braw < 0 ? 0 :
+                    (braw > NB - 1 ? NB - 1 : braw);
+#endif
+            }
+        }
+
+        const bool is_lt = valid && b < th;
+        bool selected = false;
+        if (s_mode == 0)
+            selected = valid && b == th;
+        else if (s_mode == 1)
+            selected = is_lt;
+        else
+            selected = valid;
+        const bool direct = s_mode == 0 && is_lt;
+
+        const unsigned selected_mask =
+            __ballot_sync(FULL, selected);
+        const unsigned direct_mask =
+            __ballot_sync(FULL, direct);
+        int warp_compact_base = 0;
+        int warp_direct_base = 0;
+        if (lane == 0) {
+            const int selected_count = __popc(selected_mask);
+            const int direct_count = __popc(direct_mask);
+            if (selected_count != 0)
+                warp_compact_base =
+                    atomicAdd(&s_compact_base, selected_count);
+            if (direct_count != 0)
+                warp_direct_base =
+                    atomicAdd(&s_direct_base, direct_count);
+        }
+        warp_compact_base =
+            __shfl_sync(FULL, warp_compact_base, 0);
+        warp_direct_base =
+            __shfl_sync(FULL, warp_direct_base, 0);
+
+        // One CTA barrier per tile is sufficient for alias safety: every
+        // source element is already in a register and every warp has reserved
+        // its compact ranges before any in-place store starts. Compact output
+        // never reaches the next (unread) tile.
+        __syncthreads();
+
+        if (direct) {
+            const int pos =
+                warp_direct_base +
+                __popc(direct_mask & lane_mask);
+            if (pos < K) {
+                oi[pos] =
+                    dsa_litetopk::candidate_decode_index(
+                        raw_idx);
+            }
+        }
+        if (selected) {
+            const int pos =
+                warp_compact_base +
+                __popc(selected_mask & lane_mask);
+            vrow[pos] = raw_value;
+            irow[pos] = raw_idx;
+        }
+    }
+    __syncthreads();
+
+    const int selected_n = s_compact_base;
+    const int output_base = s_mode == 0 ? s_count_lt : 0;
+    const int k_target = s_k_target;
+
+    // Exact fallback with fewer than K finite buffered candidates.
+    if (s_mode == 2 && selected_n <= K) {
+        for (int j = tid; j < selected_n; j += BT) {
+            oi[j] =
+                dsa_litetopk::candidate_decode_index(
+                    irow[j]);
+        }
+        for (int j = selected_n + tid; j < K; j += BT) {
+            oi[j] = 0;
+        }
+        return;
+    }
+    if (selected_n == 0 || k_target == 0) {
+        for (int j = output_base + tid; j < K; j += BT) {
+            oi[j] = 0;
+        }
+        return;
+    }
+
+    // Radix-select only the compacted set. In the expected sparse-refresh
+    // case this is exactly the threshold bucket and k_target == K-count_lt.
+    __shared__ uint32_t hist[RADIX];
+    __shared__ uint32_t desired;
+    __shared__ uint32_t kfind;
+    __shared__ int s_pivot_lt;
+    __shared__ int s_write_lt;
+    __shared__ int s_write_eq;
+    if (tid == 0) {
+        desired = 0u;
+        kfind = static_cast<uint32_t>(k_target);
+    }
+    __syncthreads();
+
+    uint32_t mask = 0u;
+    #pragma unroll
+    for (int pass = 0; pass < 4; ++ pass) {
+        const int shift = 24 - pass * 8;
+        hist[tid] = 0;
+        __syncthreads();
+        const uint32_t d = desired;
+        for (int j = tid; j < selected_n; j += BT) {
+            const uint32_t e = compact_enc_float(
+                dsa_litetopk::candidate_decode_score(
+                    vrow[j], irow[j]));
+            if ((e & mask) == (d & mask))
+                atomicAdd(&hist[(e >> shift) & 0xffu], 1u);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            uint32_t acc = 0;
+            const uint32_t kf = kfind;
+            for (int digit = 0; digit < RADIX; ++ digit) {
+                const uint32_t h = hist[digit];
+                if (acc < kf && kf <= acc + h) {
+                    desired =
+                        d | (static_cast<uint32_t>(digit) << shift);
+                    kfind = kf - acc;
+                    break;
+                }
+                acc += h;
+            }
+        }
+        __syncthreads();
+        mask |= 0xffu << shift;
+    }
+    const uint32_t pivot = desired;
+
+    if (tid == 0) {
+        s_pivot_lt = 0;
+        s_write_lt = 0;
+        s_write_eq = 0;
+    }
+    __syncthreads();
+    int pivot_lt = 0;
+    for (int j = tid; j < selected_n; j += BT)
+        pivot_lt += compact_enc_float(
+            dsa_litetopk::candidate_decode_score(
+                vrow[j], irow[j])) < pivot;
+    atomicAdd(&s_pivot_lt, pivot_lt);
+    __syncthreads();
+    const int eq_take = max(k_target - s_pivot_lt, 0);
+
+    for (int j = tid; j < selected_n; j += BT) {
+        const float v =
+            dsa_litetopk::candidate_decode_score(
+                vrow[j], irow[j]);
+        const uint32_t e = compact_enc_float(v);
+        if (e < pivot) {
+            const int w = atomicAdd(&s_write_lt, 1);
+            const int pos = output_base + w;
+            if (pos < K) {
+                oi[pos] =
+                    dsa_litetopk::candidate_decode_index(
+                        irow[j]);
+            }
+        } else if (e == pivot) {
+            const int equal_rank = atomicAdd(&s_write_eq, 1);
+            if (equal_rank < eq_take) {
+                const int pos =
+                    output_base + s_pivot_lt + equal_rank;
+                if (pos < K) {
+                    oi[pos] =
+                        dsa_litetopk::candidate_decode_index(
+                            irow[j]);
+                }
+            }
+        }
+    }
+}
+#endif
+
 static int compute_smem_bytes() {
     const int esz_fp8 = 1, esz_f32 = 4;
     const int smem_q  = BLOCK_Q * NUM_HEADS * HEAD_DIM * esz_fp8;
@@ -623,10 +1452,26 @@ static int compute_smem_bytes() {
 #else
     const int smem_slots = 4 * (int)sizeof(uint32_t);  // tmem ptr + daemon mailboxes
 #endif
+#ifdef DSA_CHUNKED_EMIT
+#ifdef DSA_CANDIDATE_FP16_LOCAL32
+    constexpr int emit_record_bytes = (int)sizeof(uint32_t);
+#else
+    constexpr int emit_record_bytes = (int)sizeof(uint64_t);
+#endif
+    const int smem_warpq =
+        (MATH_THREADS / 32) * BLOCK_Q *
+        ((int)sizeof(int32_t) +
+         DSA_EMIT_LANE_SLOTS * 32 * emit_record_bytes);
+#else
     const int smem_warpq = (MATH_THREADS / 32) * BLOCK_Q *
                            ((int)sizeof(int32_t) + DSA_WARP_QUEUE_CAP * ((int)sizeof(float) + (int)sizeof(int32_t)));
+#endif
+#ifdef DSA_STATIC_GATE
+    const int smem_hist = 0;
+#else
     const int smem_hist = BLOCK_Q * 256 * (int)sizeof(int32_t);  // per-CTA refresh
                                                                   // histogram (NB<=256)
+#endif
 #ifdef DSA_HIST_DEFER
     const int smem_safe = BLOCK_Q * (int)sizeof(int32_t);  // deferred-feed watermark
 #else
@@ -636,6 +1481,69 @@ static int compute_smem_bytes() {
            NUM_KV_STAGES * smem_kv + NUM_KV_STAGES * smem_ks +
            smem_barriers + smem_slots + smem_warpq + smem_hist + smem_safe;
 }
+
+#ifdef DSA_CHUNKED_EMIT
+struct ChunkedEmitWorkspace {
+    torch::Tensor storage;
+    int chunks_per_split;
+};
+
+static ChunkedEmitWorkspace make_chunked_emit_workspace(
+        int rows, int seq_len_kv, int num_kv_splits,
+        const torch::TensorOptions& options) {
+    const int num_q_blocks =
+        (rows + BLOCK_Q - 1) / BLOCK_Q;
+    const int total_blocks =
+        (seq_len_kv + BLOCK_KV - 1) / BLOCK_KV;
+    const int blocks_per_split =
+        (total_blocks + num_kv_splits - 1) / num_kv_splits;
+    const int chunks_per_split =
+        (blocks_per_split + DSA_EMIT_CHUNK_BLOCKS - 1) /
+        DSA_EMIT_CHUNK_BLOCKS;
+    const int64_t num_chunks =
+        static_cast<int64_t>(num_q_blocks) * num_kv_splits *
+        chunks_per_split * (MATH_THREADS / 32);
+    const int64_t record_count =
+        num_chunks * BLOCK_Q * DSA_EMIT_LANE_SLOTS * 32;
+    const int64_t count_words = num_chunks * 32;
+    const int64_t storage_words =
+        record_count + (count_words + 1) / 2;
+    return {
+        torch::empty({storage_words}, options.dtype(torch::kLong)),
+        chunks_per_split,
+    };
+}
+
+static void compact_chunked_emit(
+        const ChunkedEmitWorkspace& workspace,
+        torch::Tensor cand_val,
+        torch::Tensor cand_idx,
+        torch::Tensor cand_cnt,
+        int num_kv_splits,
+        cudaStream_t stream,
+        uint32_t probe_group,
+        uint64_t probe_magic,
+        uint32_t probe_add_max) {
+    const int rows = static_cast<int>(cand_val.size(0));
+    const int cap = static_cast<int>(cand_val.size(1));
+    const int num_q_blocks =
+        (rows + BLOCK_Q - 1) / BLOCK_Q;
+    compact_chunked_emit_kernel<<<num_q_blocks, MATH_THREADS, 0, stream>>>(
+        reinterpret_cast<const uint64_t*>(
+            workspace.storage.data_ptr<int64_t>()),
+        candidate_data_ptr(cand_val),
+        cand_idx.data_ptr<int32_t>(),
+        cand_cnt.data_ptr<int32_t>(),
+        rows,
+        cap,
+        num_kv_splits,
+        workspace.chunks_per_split,
+        probe_group,
+        probe_magic,
+        probe_add_max);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+#endif
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk(
         torch::Tensor q,
@@ -676,6 +1584,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk(
     const int num_heads = (int)q.size(1);
     const int head_dim = (int)q.size(2);
     const int seq_len_kv = (int)kv.size(0);
+#if defined(DSA_CANDIDATE_U16) && \
+    !defined(DSA_CANDIDATE_U16_BUCKET8_FRAC8)
+    TORCH_CHECK(
+        seq_len_kv <= (1 << dsa_litetopk::kCandidateIndexBits),
+        "DSA_CANDIDATE_U16 supports at most 1M KV positions");
+#endif
     const int topk = static_cast<int>(topk64);
     // Sparse-only: honor a caller-provided cap in [topk, S).
     const int cand_cap = (cand_cap64 >= topk && cand_cap64 < seq_len_kv)
@@ -684,9 +1598,23 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk(
     TORCH_CHECK(kv.size(1) == HEAD_DIM, "kv D mismatch");
     TORCH_CHECK(origin.numel() == seq_len && inv_delta.numel() == seq_len && th_bucket.numel() == seq_len, "bucket params must have Q elements");
     const int num_buckets = static_cast<int>(num_buckets64);
+#ifdef DSA_STATIC_GATE
+    TORCH_CHECK(refresh_every64 == 0,
+                "DSA_STATIC_GATE requires refresh_every=0");
+#endif
+#ifdef DSA_SPARSE_REFRESH
+    TORCH_CHECK(refresh_every64 > 0,
+                "DSA_SPARSE_REFRESH requires refresh_every>0");
+#endif
     const bool external_refresh = (refresh_every64 < 0);
     const int refresh_every = external_refresh ? 0x7fffffff : static_cast<int>(refresh_every64);
-    TORCH_CHECK(num_buckets >= 2 && num_buckets <= 256, "num_buckets out of range (smem hist sized for 256)");
+#ifdef DSA_INPLACE_BOUNDARY_SELECT
+    TORCH_CHECK(num_buckets >= 3 && num_buckets <= 256,
+                "in-place boundary select requires 3 <= num_buckets <= 256");
+#else
+    TORCH_CHECK(num_buckets >= 2 && num_buckets <= 256,
+                "num_buckets out of range (smem hist sized for 256)");
+#endif
     TORCH_CHECK(topk >= 1 && topk <= cand_cap, "topk must be in [1, cand_cap]");
     TORCH_CHECK(refresh_every64 >= -1, "refresh_every must be >= -1");
     TORCH_CHECK(seed_val.dim() == 2 && seed_idx.dim() == 2, "seed tensors must be [Q, seed_k]");
@@ -694,8 +1622,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk(
                 "seed tensor shape mismatch");
     const int seed_k = static_cast<int>(seed_val.size(1));
     TORCH_CHECK(seed_k <= cand_cap, "seed_k must be <= cand_cap");
+#ifdef DSA_SPARSE_REFRESH
+    TORCH_CHECK(
+        seed_k == 0,
+        "DSA_SPARSE_REFRESH generic scan requires empty seeds; use the "
+        "prepared ext API so sampled positions are not double-counted");
+#endif
 
-    auto cand_val = torch::empty({seq_len, cand_cap}, q.options().dtype(torch::kFloat));
+    auto cand_val = torch::empty(
+        {seq_len, cand_cap}, candidate_options(q.options()));
     auto cand_idx = torch::empty({seq_len, cand_cap}, q.options().dtype(torch::kInt));
     auto cand_cnt = torch::full({seq_len}, seed_k, q.options().dtype(torch::kInt));
     auto bcount = torch::zeros({seq_len, num_buckets}, q.options().dtype(torch::kInt));
@@ -724,10 +1659,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk(
                         NUM_HEADS, seq_len, NUM_HEADS, BLOCK_Q, NUM_HEADS, 0);
 
     const int smem = compute_smem_bytes();
-    auto kernel = &dsa_litetopk::sm100_dsa_litetopk<
-        NUM_HEADS, HEAD_DIM, BLOCK_Q, BLOCK_KV, NUM_Q_STAGES, NUM_KV_STAGES,
-        NUM_SMS, SPEC_THREADS, MATH_THREADS>;
-    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
 
     // V1 KV-split grid: x = q-blocks, y = KV splits (~4 CTA waves per SM).
     const int num_q_blocks = (seq_len + BLOCK_Q - 1) / BLOCK_Q;
@@ -744,6 +1675,36 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk(
     }
     if (num_kv_splits < 1) num_kv_splits = 1;
     if (num_kv_splits > total_kv_blocks) num_kv_splits = total_kv_blocks > 0 ? total_kv_blocks : 1;
+#ifdef DSA_CANDIDATE_U16
+    TORCH_CHECK(
+        num_kv_splits == 1,
+        "DSA_CANDIDATE_U16 requires a single KV split so sparse refresh can "
+        "publish an exact boundary certificate");
+#endif
+#ifdef DSA_SPARSE_REFRESH
+    auto kernel = num_kv_splits == 1
+        ? &dsa_litetopk::sm100_dsa_litetopk<
+              NUM_HEADS, HEAD_DIM, BLOCK_Q, BLOCK_KV,
+              NUM_Q_STAGES, NUM_KV_STAGES, NUM_SMS,
+              SPEC_THREADS, MATH_THREADS, MATH_THREADS / 128, true>
+        : &dsa_litetopk::sm100_dsa_litetopk<
+              NUM_HEADS, HEAD_DIM, BLOCK_Q, BLOCK_KV,
+              NUM_Q_STAGES, NUM_KV_STAGES, NUM_SMS,
+              SPEC_THREADS, MATH_THREADS, MATH_THREADS / 128, false>;
+#else
+    auto kernel = &dsa_litetopk::sm100_dsa_litetopk<
+        NUM_HEADS, HEAD_DIM, BLOCK_Q, BLOCK_KV, NUM_Q_STAGES, NUM_KV_STAGES,
+        NUM_SMS, SPEC_THREADS, MATH_THREADS>;
+#endif
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        reinterpret_cast<void*>(kernel),
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem));
+#if defined(DSA_CHUNKED_EMIT) && \
+    !defined(DSA_CHUNKED_FLUSH_DIRECT)
+    auto emit_workspace = make_chunked_emit_workspace(
+        seq_len, seq_len_kv, num_kv_splits, q.options());
+#endif
     dim3 grid((unsigned)num_q_blocks, (unsigned)num_kv_splits, 1);
     kernel<<<grid, SPEC_THREADS + MATH_THREADS, smem, stream>>>(
         (uint32_t)seq_len, (uint32_t)seq_len_kv,
@@ -751,10 +1712,28 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk(
         origin.data_ptr<float>(), inv_delta.data_ptr<float>(), th_bucket.data_ptr<int32_t>(),
         bcount.data_ptr<int32_t>(), (uint32_t)num_buckets, (uint32_t)topk, (uint32_t)refresh_every,
         (uint32_t)num_kv_splits, 0u, 0ULL, 0u,
-        cand_val.data_ptr<float>(), cand_idx.data_ptr<int32_t>(),
+#if defined(DSA_CHUNKED_EMIT) && \
+    !defined(DSA_CHUNKED_FLUSH_DIRECT)
+        reinterpret_cast<uint64_t*>(
+            emit_workspace.storage.data_ptr<int64_t>()),
+#endif
+        candidate_data_ptr(cand_val), cand_idx.data_ptr<int32_t>(),
         cand_cnt.data_ptr<int32_t>(), (uint32_t)cand_cap,
         tm_q, tm_kv, tm_ks, tm_w);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+#if defined(DSA_CHUNKED_EMIT) && \
+    !defined(DSA_CHUNKED_FLUSH_DIRECT)
+    compact_chunked_emit(
+        emit_workspace,
+        cand_val,
+        cand_idx,
+        cand_cnt,
+        num_kv_splits,
+        stream,
+        0u,
+        0ULL,
+        0u);
+#endif
 
     if (external_refresh) {
         int block = 128;
@@ -785,7 +1764,10 @@ void seed_prep_litetopk_(torch::Tensor slog, int64_t num_buckets64, int64_t topk
     const int NB = (int)num_buckets64;
     const int K = (int)topk64;
     const int cap = (int)cand_cap64;
+    TORCH_CHECK(NB >= 2 && NB <= 4096, "num_buckets out of range");
+    TORCH_CHECK(K >= 1 && cap >= K, "need cap >= topk >= 1");
     TORCH_CHECK(cand_val.size(0) >= Q && cand_val.size(1) == cap, "cand_val shape");
+    check_candidate_dtype(cand_val);
     TORCH_CHECK(bcount.size(0) >= Q && bcount.size(1) == NB, "bcount shape");
     TORCH_CHECK((slog.stride(0) % 4) == 0 &&
                 (reinterpret_cast<uintptr_t>(slog.data_ptr()) % 16) == 0,
@@ -801,6 +1783,11 @@ void seed_prep_litetopk_(torch::Tensor slog, int64_t num_buckets64, int64_t topk
         }
     }
     const int emit_limit = emit_limit64 == 0 ? 0 : (emit_limit64 > 0 ? (int)emit_limit64 : head);
+#ifdef DSA_CANDIDATE_U16
+    TORCH_CHECK(
+        emit_limit == 0,
+        "DSA_CANDIDATE_U16 supports the hot-only no-seed contract");
+#endif
     const int probe_stride_tok = (int)probe_stride_tok64;
     const int hist_stride = hist_stride64 > 1 ? (int)hist_stride64 : 1;
     seed_prep_kernel<<<Q, 1024, seed_smem, stream>>>(
@@ -810,7 +1797,7 @@ void seed_prep_litetopk_(torch::Tensor slog, int64_t num_buckets64, int64_t topk
         origin.data_ptr<float>(), inv_delta.data_ptr<float>(),
         th_bucket.data_ptr<int32_t>(),
         bcount.data_ptr<int32_t>(),
-        cand_val.data_ptr<float>(), cand_idx.data_ptr<int32_t>(),
+        candidate_data_ptr(cand_val), cand_idx.data_ptr<int32_t>(),
         cand_cnt.data_ptr<int32_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -841,7 +1828,7 @@ seed_prep_litetopk(torch::Tensor slog, int64_t num_buckets64, int64_t topk64,
     auto inv_delta = torch::empty({Q}, opts_f);
     auto th_bucket = torch::empty({Q}, opts_i);
     auto bcount = torch::empty({Q, NB}, opts_i);      // fully overwritten
-    auto cand_val = torch::empty({Q, cap}, opts_f);
+    auto cand_val = torch::empty({Q, cap}, candidate_options(opts_f));
     auto cand_idx = torch::empty({Q, cap}, opts_i);
     auto cand_cnt = torch::empty({Q}, opts_i);
 
@@ -856,6 +1843,11 @@ seed_prep_litetopk(torch::Tensor slog, int64_t num_buckets64, int64_t topk64,
         }
     }
     const int emit_limit = emit_limit64 == 0 ? 0 : (emit_limit64 > 0 ? (int)emit_limit64 : head);
+#ifdef DSA_CANDIDATE_U16
+    TORCH_CHECK(
+        emit_limit == 0,
+        "DSA_CANDIDATE_U16 supports the hot-only no-seed contract");
+#endif
     const int probe_stride_tok = (int)probe_stride_tok64;
     const int hist_stride = hist_stride64 > 1 ? (int)hist_stride64 : 1;
     seed_prep_kernel<<<Q, 1024, seed_smem, stream>>>(
@@ -865,7 +1857,7 @@ seed_prep_litetopk(torch::Tensor slog, int64_t num_buckets64, int64_t topk64,
         origin.data_ptr<float>(), inv_delta.data_ptr<float>(),
         th_bucket.data_ptr<int32_t>(),
         bcount.data_ptr<int32_t>(),
-        cand_val.data_ptr<float>(), cand_idx.data_ptr<int32_t>(),
+        candidate_data_ptr(cand_val), cand_idx.data_ptr<int32_t>(),
         cand_cnt.data_ptr<int32_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return std::make_tuple(origin, inv_delta, th_bucket, cand_val, cand_idx,
@@ -902,15 +1894,36 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk_
                 "all tensors must be contiguous");
     TORCH_CHECK(q.scalar_type() == torch::kFloat8_e4m3fn && kv.scalar_type() == torch::kFloat8_e4m3fn,
                 "q/kv must be fp8_e4m3fn");
+    check_candidate_dtype(cand_val);
     const int seq_len = (int)q.size(0);
     const int seq_len_kv = (int)kv.size(0);
+#if defined(DSA_CANDIDATE_U16) && \
+    !defined(DSA_CANDIDATE_U16_BUCKET8_FRAC8)
+    TORCH_CHECK(
+        seq_len_kv <= (1 << dsa_litetopk::kCandidateIndexBits),
+        "DSA_CANDIDATE_U16 supports at most 1M KV positions");
+#endif
     const int cand_cap = (int)cand_val.size(1);
     const int num_buckets = (int)num_buckets64;
     const int topk = (int)topk64;
     TORCH_CHECK(q.size(1) == NUM_HEADS && q.size(2) == HEAD_DIM, "only GLM DSA H=32 D=128 is supported");
+    TORCH_CHECK(num_buckets >= 3 && num_buckets <= 256,
+                "prepared scan requires 3 <= num_buckets <= 256");
+    TORCH_CHECK(topk >= 1 && topk <= cand_cap,
+                "topk must be in [1, cand_cap]");
+    TORCH_CHECK(refresh_every64 >= -1,
+                "refresh_every must be >= -1");
     TORCH_CHECK(cand_val.size(0) == seq_len && cand_idx.sizes() == cand_val.sizes() &&
                 cand_cnt.numel() == seq_len && bcount.size(0) == seq_len && bcount.size(1) == num_buckets,
                 "prepared buffer shape mismatch");
+#ifdef DSA_STATIC_GATE
+    TORCH_CHECK(refresh_every64 == 0,
+                "DSA_STATIC_GATE requires refresh_every=0");
+#endif
+#ifdef DSA_SPARSE_REFRESH
+    TORCH_CHECK(refresh_every64 > 0,
+                "DSA_SPARSE_REFRESH requires refresh_every>0");
+#endif
     const bool external_refresh = (refresh_every64 < 0);
     const int refresh_every = external_refresh ? 0x7fffffff : (int)refresh_every64;
 
@@ -927,10 +1940,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk_
                         NUM_HEADS, seq_len, NUM_HEADS, BLOCK_Q, NUM_HEADS, 0);
 
     const int smem = compute_smem_bytes();
-    auto kernel = &dsa_litetopk::sm100_dsa_litetopk<
-        NUM_HEADS, HEAD_DIM, BLOCK_Q, BLOCK_KV, NUM_Q_STAGES, NUM_KV_STAGES,
-        NUM_SMS, SPEC_THREADS, MATH_THREADS>;
-    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
 
     const int num_q_blocks = (seq_len + BLOCK_Q - 1) / BLOCK_Q;
     const int total_kv_blocks = (seq_len_kv + BLOCK_KV - 1) / BLOCK_KV;
@@ -946,6 +1955,36 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk_
     }
     if (num_kv_splits < 1) num_kv_splits = 1;
     if (num_kv_splits > total_kv_blocks) num_kv_splits = total_kv_blocks > 0 ? total_kv_blocks : 1;
+#ifdef DSA_CANDIDATE_U16
+    TORCH_CHECK(
+        num_kv_splits == 1,
+        "DSA_CANDIDATE_U16 requires a single KV split so sparse refresh can "
+        "publish an exact boundary certificate");
+#endif
+#ifdef DSA_SPARSE_REFRESH
+    auto kernel = num_kv_splits == 1
+        ? &dsa_litetopk::sm100_dsa_litetopk<
+              NUM_HEADS, HEAD_DIM, BLOCK_Q, BLOCK_KV,
+              NUM_Q_STAGES, NUM_KV_STAGES, NUM_SMS,
+              SPEC_THREADS, MATH_THREADS, MATH_THREADS / 128, true>
+        : &dsa_litetopk::sm100_dsa_litetopk<
+              NUM_HEADS, HEAD_DIM, BLOCK_Q, BLOCK_KV,
+              NUM_Q_STAGES, NUM_KV_STAGES, NUM_SMS,
+              SPEC_THREADS, MATH_THREADS, MATH_THREADS / 128, false>;
+#else
+    auto kernel = &dsa_litetopk::sm100_dsa_litetopk<
+        NUM_HEADS, HEAD_DIM, BLOCK_Q, BLOCK_KV, NUM_Q_STAGES, NUM_KV_STAGES,
+        NUM_SMS, SPEC_THREADS, MATH_THREADS>;
+#endif
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        reinterpret_cast<void*>(kernel),
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem));
+#if defined(DSA_CHUNKED_EMIT) && \
+    !defined(DSA_CHUNKED_FLUSH_DIRECT)
+    auto emit_workspace = make_chunked_emit_workspace(
+        seq_len, seq_len_kv, num_kv_splits, q.options());
+#endif
     int grid_q = num_q_blocks;
 #ifdef DSA_PERSIST
     // persistent scheduling for the merge path: one CTA per SM loops
@@ -962,10 +2001,32 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mqa_logits_dsa_litetopk_
         (uint32_t)num_kv_splits, (uint32_t)probe_group64,
         probe_group64 > 0 ? (((1ULL << 42) + (uint64_t)probe_group64 - 1) / (uint64_t)probe_group64) : 0ULL,
         (uint32_t)probe_add_max64,
-        cand_val.data_ptr<float>(), cand_idx.data_ptr<int32_t>(),
+#if defined(DSA_CHUNKED_EMIT) && \
+    !defined(DSA_CHUNKED_FLUSH_DIRECT)
+        reinterpret_cast<uint64_t*>(
+            emit_workspace.storage.data_ptr<int64_t>()),
+#endif
+        candidate_data_ptr(cand_val), cand_idx.data_ptr<int32_t>(),
         cand_cnt.data_ptr<int32_t>(), (uint32_t)cand_cap,
         tm_q, tm_kv, tm_ks, tm_w);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+#if defined(DSA_CHUNKED_EMIT) && \
+    !defined(DSA_CHUNKED_FLUSH_DIRECT)
+    compact_chunked_emit(
+        emit_workspace,
+        cand_val,
+        cand_idx,
+        cand_cnt,
+        num_kv_splits,
+        stream,
+        static_cast<uint32_t>(probe_group64),
+        probe_group64 > 0
+            ? (((1ULL << 42) +
+                static_cast<uint64_t>(probe_group64) - 1) /
+               static_cast<uint64_t>(probe_group64))
+            : 0ULL,
+        static_cast<uint32_t>(probe_add_max64));
+#endif
 
     if (external_refresh) {
         int block = 128;
@@ -1026,6 +2087,8 @@ std::tuple<torch::Tensor, torch::Tensor> compact_topk_min_thr_litetopk(
     TORCH_CHECK(cand_val.dim() == 2 && cand_idx.sizes() == cand_val.sizes(), "candidate tensors must be [R,CAP]");
     int R = static_cast<int>(cand_val.size(0));
     int CAP = static_cast<int>(cand_val.size(1));
+    TORCH_CHECK(cand_cnt.dim() == 1 && cand_cnt.numel() == R,
+                "cand_cnt must have R elements");
     int K = static_cast<int>(k64);
     int NB = static_cast<int>(num_buckets64);
     TORCH_CHECK(K >= 1 && K <= CAP, "K must be in [1,CAP]");
@@ -1041,7 +2104,8 @@ std::tuple<torch::Tensor, torch::Tensor> compact_topk_min_thr_litetopk(
                     seed_base->numel() >= R,
                     "seed_base [R] int32 required with probe_group");
     }
-    compact_topk_min_thr_litetopk_kernel<<<R, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+    compact_topk_min_thr_litetopk_kernel<<<
+        R, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
         cand_val.data_ptr<float>(), cand_idx.data_ptr<int32_t>(), cand_cnt.data_ptr<int32_t>(),
         origin.data_ptr<float>(), inv_delta.data_ptr<float>(), th_bucket.data_ptr<int32_t>(),
         R, CAP, K, NB, out_val.data_ptr<float>(), out_idx.data_ptr<int32_t>(),
@@ -1053,9 +2117,90 @@ std::tuple<torch::Tensor, torch::Tensor> compact_topk_min_thr_litetopk(
     return std::make_tuple(out_val, out_idx);
 }
 
+#ifdef DSA_INPLACE_BOUNDARY_SELECT
+// Destructive single-use selector for the fused indexer. The ordinary
+// compact_topk_min_thr_litetopk binding above deliberately remains
+// non-mutating: external callers may select from the same candidates more
+// than once. This entry point consumes cand_val/cand_idx by compacting its
+// selected subset in place. Candidate indices must already be in final corpus
+// space, as they are for the current chunked-flush scan path. Gate4 candidate
+// values are already in bucket space, and the caller owns the final idx
+// output, so this specialization allocates and writes no discarded values or
+// temporary index tensor.
+void compact_topk_min_thr_inplace_idx_out_litetopk(
+        torch::Tensor cand_val,
+        torch::Tensor cand_idx,
+        torch::Tensor cand_cnt,
+        torch::Tensor th_bucket,
+        torch::Tensor boundary_meta,
+        int64_t num_buckets64,
+        int64_t k64,
+        torch::Tensor out_idx) {
+    TORCH_CHECK(cand_val.is_cuda() && cand_idx.is_cuda() &&
+                cand_cnt.is_cuda() && th_bucket.is_cuda() &&
+                boundary_meta.is_cuda() && out_idx.is_cuda(),
+                "tensors must be CUDA");
+    TORCH_CHECK(cand_val.is_contiguous() && cand_idx.is_contiguous() &&
+                cand_cnt.is_contiguous() && th_bucket.is_contiguous() &&
+                boundary_meta.is_contiguous() && out_idx.is_contiguous(),
+                "tensors must be contiguous");
+    check_candidate_dtype(cand_val);
+    TORCH_CHECK(cand_idx.scalar_type() == torch::kInt &&
+                cand_cnt.scalar_type() == torch::kInt &&
+                out_idx.scalar_type() == torch::kInt,
+                "idx/cnt/out_idx must be int32");
+    TORCH_CHECK(th_bucket.scalar_type() == torch::kInt,
+                "th_bucket must be int32");
+    TORCH_CHECK(boundary_meta.scalar_type() == torch::kInt,
+                "boundary_meta must be int32");
+    TORCH_CHECK(cand_val.dim() == 2 &&
+                cand_idx.sizes() == cand_val.sizes(),
+                "candidate tensors must be [R,CAP]");
+    const int R = static_cast<int>(cand_val.size(0));
+    const int CAP = static_cast<int>(cand_val.size(1));
+    TORCH_CHECK(cand_cnt.dim() == 1 && cand_cnt.numel() == R,
+                "cand_cnt must have R elements");
+    const int K = static_cast<int>(k64);
+    const int NB = static_cast<int>(num_buckets64);
+    TORCH_CHECK(K >= 1 && K <= CAP, "K must be in [1,CAP]");
+    TORCH_CHECK(NB >= 3 && NB <= 256,
+                "in-place boundary select requires 3 <= num_buckets <= 256");
+    TORCH_CHECK(th_bucket.numel() == R,
+                "th_bucket must have R elements");
+    TORCH_CHECK(boundary_meta.dim() == 2 &&
+                boundary_meta.size(0) == R &&
+                boundary_meta.size(1) == NB,
+                "boundary_meta must be [R,num_buckets]");
+    TORCH_CHECK(out_idx.dim() == 2 &&
+                out_idx.size(0) == R &&
+                out_idx.size(1) == K,
+                "out_idx must be [R,K]");
+
+    compact_topk_min_thr_inplace_idx_out_litetopk_kernel<<<
+        R, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        candidate_data_ptr(cand_val),
+        cand_idx.data_ptr<int32_t>(),
+        cand_cnt.data_ptr<int32_t>(),
+        th_bucket.data_ptr<int32_t>(),
+        boundary_meta.data_ptr<int32_t>(),
+        R,
+        CAP,
+        K,
+        NB,
+        out_idx.data_ptr<int32_t>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+#endif
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+#ifdef DSA_CANDIDATE_U16
+    m.def(
+        "candidate_value_u16_litetopk",
+        []() { return true; },
+        "Reports the packed six-byte candidate ABI");
+#endif
     m.def("seed_prep_litetopk_", &seed_prep_litetopk_,
           "In-place fused sample prep (caller-owned buffers)",
           pybind11::arg("slog"), pybind11::arg("num_buckets"), pybind11::arg("topk"),
@@ -1097,4 +2242,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_buckets"), pybind11::arg("topk"),
           pybind11::arg("probe_group") = 0, pybind11::arg("probe_add_max") = 0,
           pybind11::arg("seed_base") = pybind11::none());
+#ifdef DSA_INPLACE_BOUNDARY_SELECT
+    m.def("compact_topk_min_thr_inplace_idx_out_litetopk",
+          &compact_topk_min_thr_inplace_idx_out_litetopk,
+          "Single-use Gate4 threshold top-k directly into caller idx output",
+          pybind11::arg("cand_val"),
+          pybind11::arg("cand_idx"),
+          pybind11::arg("cand_cnt"),
+          pybind11::arg("th_bucket"),
+          pybind11::arg("boundary_meta"),
+          pybind11::arg("num_buckets"),
+          pybind11::arg("topk"),
+          pybind11::arg("out_idx"));
+#endif
 }

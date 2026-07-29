@@ -22,9 +22,7 @@
 // OVERWRITE-WRITE CONTRACT: outputs are caller-owned persistent buffers,
 // refilled in place with NO fill/zero pre-pass. u_phys padding beyond
 // counts[g] stays STALE — every consumer must bound reads by counts (the
-// masked attention kernel's topk_length does). Ported 1:1 from the
-// research-stack union_bitmap.cu (bit-exact validated vs the allocating
-// builders, incl. dirty-buffer double-overwrite).
+// masked attention kernel's topk_length does).
 
 #include <cuda_runtime.h>
 #include <cstdint>
