@@ -148,6 +148,12 @@ void launch_flash_topk_select_thr_idx_bf16(const __nv_bfloat16* buf, const int32
 // block finalize（lt 全 copy + eq 上小 radix 补齐）。大 BUF（阈值解耦放大 buffer）下单 block
 // 串行扫 BUF 是瓶颈，mb 显著缩短。cand_*（eq）与 lt_* 缓冲均 [R,CAP] val/idx + [R] cnt，
 // 由调用方分配（CAP>=K）。
+// hierarchical finalize 的可选 workspace（默认 direct-lt；实验编译可同时
+// 覆盖 K=512 staged-compact finalize）：
+//   先用 flash_topk_select_thr_mb_direct_part_slots 查询每个 part 数组的 slot 数；
+//   part_val / part_idx 需要 slots*K 个元素，part_cnt 需要 slots 个 int32。
+//   三个指针必须同时提供；全为 nullptr 时保持旧行为，由 selector 内部 cudaMallocAsync。
+size_t flash_topk_select_thr_mb_direct_part_slots(int R, int BUF, int K, int CAP);
 void launch_flash_topk_select_thr_mb_idx_fp32(
     const float* buf, const int32_t* buf_idx, const int32_t* sample_idx,
     int R, int BUF, int K, int CAP,
@@ -155,7 +161,9 @@ void launch_flash_topk_select_thr_mb_idx_fp32(
     const int32_t* th, const int32_t* qcount, int NB,
     float* cand_val, int32_t* cand_idx, int32_t* cand_cnt,
     float* lt_val, int32_t* lt_idx, int32_t* lt_cnt,
-    float* out_val, int* out_idx, cudaStream_t stream);
+    float* out_val, int* out_idx, cudaStream_t stream,
+    bool debucket_output, bool counters_preinitialized,
+    float* part_val, int32_t* part_idx, int32_t* part_cnt);
 void launch_flash_topk_select_thr_mb_idx_fp16(
     const __half* buf, const int32_t* buf_idx, const int32_t* sample_idx,
     int R, int BUF, int K, int CAP,
@@ -163,7 +171,10 @@ void launch_flash_topk_select_thr_mb_idx_fp16(
     const int32_t* th, const int32_t* qcount, int NB,
     __half* cand_val, int32_t* cand_idx, int32_t* cand_cnt,
     __half* lt_val, int32_t* lt_idx, int32_t* lt_cnt,
-    __half* out_val, int* out_idx, bool coords_fp16, cudaStream_t stream);
+    __half* out_val, int* out_idx, bool coords_fp16, cudaStream_t stream,
+    int skip_zero, bool bucket_space, bool debucket_output,
+    bool counters_preinitialized,
+    __half* part_val, int32_t* part_idx, int32_t* part_cnt);
 void launch_flash_topk_select_thr_mb_idx_bf16(
     const __nv_bfloat16* buf, const int32_t* buf_idx, const int32_t* sample_idx,
     int R, int BUF, int K, int CAP,
@@ -171,7 +182,8 @@ void launch_flash_topk_select_thr_mb_idx_bf16(
     const int32_t* th, const int32_t* qcount, int NB,
     __nv_bfloat16* cand_val, int32_t* cand_idx, int32_t* cand_cnt,
     __nv_bfloat16* lt_val, int32_t* lt_idx, int32_t* lt_cnt,
-    __nv_bfloat16* out_val, int* out_idx, bool coords_bf16, cudaStream_t stream);
+    __nv_bfloat16* out_val, int* out_idx, bool coords_bf16, cudaStream_t stream,
+    __nv_bfloat16* part_val, int32_t* part_idx, int32_t* part_cnt);
 
 // ---- packed 分段 K-min select（fp16 专用）-----------------------------------
 // buf_pack[R, NSEG*CAP] int32：packed = (fp16_score_bits<<16) | off16；

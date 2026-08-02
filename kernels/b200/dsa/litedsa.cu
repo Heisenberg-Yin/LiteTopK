@@ -3,13 +3,13 @@
 // TVM-FFI binding for grouped packed sparse prefill attention on SM100.
 // litedsa_union_qm builds the union, membership bitmap, and physical indices.
 // litedsa_masked_mla_fp8 invokes the vendored FlashMLA-derived FP8 kernel
-// under csrc/vendor_fmla/.
+// in the self-contained litedsa_attention_sm100.cuh amalgamation.
 
 #include <cuda_runtime.h>
 
-#include <flashinfer/litedsa/litedsa_union.cuh>
+#include "litedsa_union.cuh"
 
-#include "sm100/prefill/sparse/fwd/head128_fp8/phase1.cuh"
+#include "litedsa_attention_sm100.cuh"
 
 #include "tvm_ffi_utils.h"
 
@@ -47,9 +47,11 @@ void litedsa_union_qm(TensorView topk_indices, TensorView u_phys, TensorView cou
   TVM_FFI_ICHECK(counts.size(0) == ng && req_pg.size(0) == ng)
       << "counts/req_pg must be [ng]";
   CHECK_DIM(2, block_table);
+  TVM_FFI_ICHECK(seq_space > 0 && seq_space <= (1 << 20))
+      << "seq_space must be in (0, 1M]";
   const int s_words = static_cast<int>((seq_space + 31) / 32);
-  TVM_FFI_ICHECK(s_words % (kLiteDSAUnionThreads * 4) == 0)
-      << "seq_space must give 4-aligned word chunks";
+  TVM_FFI_ICHECK(s_words % 32 == 0)
+      << "seq_space must be 1024-position aligned";
   const int smem = litedsa_union_qm_smem_bytes(s_words);
   TVM_FFI_ICHECK(smem <= 224 * 1024) << "seq_space too large for smem bitmap";
 

@@ -12,6 +12,7 @@
 //   cand_*      : eq bucket workspace [R, CAP] + [R]
 //   lt_*        : lt bucket workspace [R, CAP] + [R]
 //   out_*       : selected top-k values/ids [R, K]
+size_t flash_topk_select_thr_mb_direct_part_slots(int R, int BUF, int K, int CAP);
 void launch_flash_topk_select_thr_mb_idx_fp16(
     const __half* buf, const int32_t* buf_idx, const int32_t* sample_idx,
     int R, int BUF, int K, int CAP,
@@ -20,7 +21,10 @@ void launch_flash_topk_select_thr_mb_idx_fp16(
     __half* cand_val, int32_t* cand_idx, int32_t* cand_cnt,
     __half* lt_val, int32_t* lt_idx, int32_t* lt_cnt,
     __half* out_val, int* out_idx, bool coords_fp16, cudaStream_t stream,
-    int skip_zero = 0, bool bucket_space = true);
+    int skip_zero = 0, bool bucket_space = true, bool debucket_output = false,
+    bool counters_preinitialized = false,
+    __half* part_val = nullptr, int32_t* part_idx = nullptr,
+    int32_t* part_cnt = nullptr);
 
 void launch_flash_topk_select_thr_mb_idx_fp32(
     const float* buf, const int32_t* buf_idx, const int32_t* sample_idx,
@@ -29,7 +33,10 @@ void launch_flash_topk_select_thr_mb_idx_fp32(
     const int32_t* th, const int32_t* qcount, int NB,
     float* cand_val, int32_t* cand_idx, int32_t* cand_cnt,
     float* lt_val, int32_t* lt_idx, int32_t* lt_cnt,
-    float* out_val, int* out_idx, cudaStream_t stream);
+    float* out_val, int* out_idx, cudaStream_t stream,
+    bool debucket_output = false, bool counters_preinitialized = false,
+    float* part_val = nullptr, int32_t* part_idx = nullptr,
+    int32_t* part_cnt = nullptr);
 
 void launch_flash_topk_select_bucket_idx_fp16(
     const __half* bucket_val, const int32_t* bucket_idx, const int32_t* bcount,
@@ -142,4 +149,3 @@ void launch_hopper_gqa_group_indexed_score_to_sparse_ip_gmma_m64n8_fp16(
     int32_t* th, int32_t* qcount, int32_t* bcount,
     __half* buf_val, int32_t* buf_idx, int BUF, int NB, int K,
     cudaStream_t stream);
-

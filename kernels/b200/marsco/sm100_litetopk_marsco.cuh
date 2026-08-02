@@ -30,6 +30,10 @@ using namespace deep_gemm;
 using namespace deep_gemm::sm90;
 using namespace deep_gemm::sm100;
 
+#ifndef LITETOPK_MARSCO_FP8_SCAN
+#define LITETOPK_MARSCO_FP8_SCAN 0
+#endif
+
 #ifndef LITETOPK_REFRESH_STRIDE
 #define LITETOPK_REFRESH_STRIDE 16
 #endif
@@ -61,11 +65,43 @@ __device__ __forceinline__ cand_t litetopk_cand_cast(float x);
 template <> __device__ __forceinline__ __half litetopk_cand_cast<__half>(float x) { return __float2half(x); }
 template <> __device__ __forceinline__ float litetopk_cand_cast<float>(float x) { return x; }
 
+// CuTe's public F8 SS wrapper performs its own full-warp election. The MARSCO
+// issue loop already elects exactly one lane because DeepGEMM's fp16 wrapper
+// is no-elect, so invoking CuTe there would nest an election under a
+// single-lane active mask. Keep one election and use the same raw instruction.
+struct MarscoMmaF8SsNoElect {
+    __device__ __forceinline__ static void fma(
+        uint64_t const& desc_a, uint64_t const& desc_b,
+        uint32_t const& tmem_c, uint32_t const& scale_c,
+        uint64_t const& instr_desc) {
+#if defined(CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED)
+        uint32_t mask[4] = {0, 0, 0, 0};
+        asm volatile(
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "setp.ne.b32 p, %4, 0;\n\t"
+            "tcgen05.mma.cta_group::1.kind::f8f6f4 "
+            "[%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t"
+            "}\n"
+            :
+            : "r"(tmem_c), "l"(desc_a), "l"(desc_b),
+              "r"(uint32_t(instr_desc >> 32)), "r"(scale_c),
+              "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
+#else
+        CUTE_INVALID_CONTROL_PATH(
+            "Attempting fp8 MARSCO scan without tcgen05 f8f6f4");
+#endif
+    }
+};
+
 template <uint32_t QN, uint32_t kHeadDim,
           uint32_t BM, uint32_t kNumKVStages,
           uint32_t kNumSMs,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
           typename cand_t = __half,
+#if LITETOPK_MARSCO_FP8_SCAN
+          typename input_t = __half,
+#endif
           uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
 __global__ __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1)
 void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows [start_row, M) are scored
@@ -91,6 +127,10 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
                     const uint32_t refresh_every,
                     const bool store_bucket_space,   // true stores affine bucket coordinates;
                                                       // false stores raw scores
+#if LITETOPK_MARSCO_FP8_SCAN
+                    const float* __restrict__ q_dequant_scale,   // [Rwork], fp8 path only
+                    const float* __restrict__ kv_dequant_scale,  // [hkv, kv_row_stride], fp8 path only
+#endif
                     const __grid_constant__ cute::TmaDescriptor tensor_map_q,   // [Hgrp*QN, D]
                     const __grid_constant__ cute::TmaDescriptor tensor_map_kv) { // [hkv*M, D]
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -121,9 +161,22 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
     constexpr uint32_t UMMA_N = QN;
     DG_STATIC_ASSERT(BM == kNumMathThreads, "one kv row per math lane");
     DG_STATIC_ASSERT(BM == UMMA_M * kNumMathWarpGroups, "BM must be 128 per warpgroup");
-    constexpr uint32_t UMMA_K = 32 / sizeof(cutlass::half_t);   // 16
-    constexpr uint32_t SW_K = 128 / sizeof(cutlass::half_t);    // 64: 128B swizzle atom (fp16)
-    DG_STATIC_ASSERT(kHeadDim % SW_K == 0, "D must be multiple of 64 (fp16 128B swizzle atom)");
+#if LITETOPK_MARSCO_FP8_SCAN
+    using scan_input_t = input_t;
+    constexpr bool kFp8Input =
+        std::is_same_v<scan_input_t, __nv_fp8_e4m3>;
+    DG_STATIC_ASSERT(
+        std::is_same_v<scan_input_t, __half> || kFp8Input,
+        "MARSCO scan input must be fp16 or fp8_e4m3");
+#else
+    using scan_input_t = __half;
+    constexpr bool kFp8Input = false;
+#endif
+    using mma_input_t =
+        std::conditional_t<kFp8Input, cutlass::float_e4m3_t, cutlass::half_t>;
+    constexpr uint32_t UMMA_K = 32 / sizeof(mma_input_t);
+    constexpr uint32_t SW_K = 128 / sizeof(mma_input_t);
+    DG_STATIC_ASSERT(kHeadDim % SW_K == 0, "D must span complete 128B swizzle atoms");
 
     // Large-D support (e.g. MS MARCO 768-d embeddings): a KV tile is split
     // into D-chunks of CHUNK_D columns; the TMA/UMMA pipeline is chunk-
@@ -136,7 +189,8 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
     // Stage byte budget: 64KB normally; 32KB when the (large) Q block is
     // resident (QN > 8) so 3 stages + Q still fit the 227KB smem limit.
     constexpr uint32_t kStageBytes = (QN > 8) ? 32768 : 65536;
-    constexpr uint32_t kChunkCapElems = kStageBytes / (BM * sizeof(__half));
+    constexpr uint32_t kChunkCapElems =
+        kStageBytes / (BM * sizeof(scan_input_t));
     constexpr uint32_t kChunkPref = (QN > 8) ? (kHeadDim > 128 ? 128 : kHeadDim)
                                              : ((kHeadDim > 256) ? 256 : kHeadDim);
     constexpr uint32_t CHUNK_D = kChunkPref < kChunkCapElems ? kChunkPref : kChunkCapElems;
@@ -144,13 +198,17 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
     DG_STATIC_ASSERT(kHeadDim % CHUNK_D == 0, "D must be a multiple of CHUNK_D");
     DG_STATIC_ASSERT(QN % 8 == 0 && QN <= 64, "QN must be a multiple of 8, <= 64");
 
-    static constexpr uint32_t SMEM_Q_BYTES = QN * kHeadDim * sizeof(__half);
-    static constexpr uint32_t SMEM_KV_TILE_BYTES = BM * CHUNK_D * sizeof(__half);
+    static constexpr uint32_t SMEM_Q_BYTES =
+        QN * kHeadDim * sizeof(scan_input_t);
+    static constexpr uint32_t SMEM_KV_TILE_BYTES =
+        BM * CHUNK_D * sizeof(scan_input_t);
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
-    __half* smem_q = reinterpret_cast<__half*>(smem_buffer);
+    scan_input_t* smem_q =
+        reinterpret_cast<scan_input_t*>(smem_buffer);
     auto smem_kv = PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<__half*>(smem_buffer + SMEM_Q_BYTES + SMEM_KV_TILE_BYTES * i);
+        return reinterpret_cast<scan_input_t*>(
+            smem_buffer + SMEM_Q_BYTES + SMEM_KV_TILE_BYTES * i);
     });
     // Double-buffered TMEM accumulators: the UMMA warp writes buffer
     // (tile & 1) while the math warps drain the other one, so the tiny N=8 MMA
@@ -181,6 +239,9 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
     auto coeff_o    = reinterpret_cast<float*>(warpq_idx + (kUseWarpQueue ? kNumMathWarps * QN * LITETOPK_WARP_QUEUE_CAP : 0));
     auto coeff_inv  = coeff_o + QN;
     auto coeff_gate = reinterpret_cast<int32_t*>(coeff_inv + QN);
+    // Only the fp8 specialization consumes this tail. Keeping it behind an
+    // if-constexpr lets the fp16 launch retain its original smem footprint.
+    auto coeff_qscale = reinterpret_cast<float*>(coeff_gate + QN);
 
     // TMEM is allocated in 32-column granules on tcgen05; QN(=8) columns per math
     // warpgroup would be an illegal sub-granule allocation, so each (warpgroup,
@@ -256,7 +317,7 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
             // first, THEN arrive_and_expect_tx (matches the DSA ordering; expecting
             // before the copy can satisfy the barrier early and let UMMA read
             // un-loaded smem).
-            tma_copy<kHeadDim, QN, 128, __half>(
+            tma_copy<kHeadDim, QN, 128, scan_input_t>(
                 &tensor_map_q, q_ready_barrier, smem_q, 0, query_base);
             q_ready_barrier->arrive_and_expect_tx(SMEM_Q_BYTES);
             // Stream KV tiles, one D-chunk per pipeline stage.
@@ -267,7 +328,7 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
                     const uint32_t stage = produced % kNumKVStages;
                     const uint32_t phase = (produced / kNumKVStages) & 1;
                     empty_kv_barriers[stage]->wait(phase ^ 1);
-                    tma_copy<CHUNK_D, BM, 128, __half>(
+                    tma_copy<CHUNK_D, BM, 128, scan_input_t>(
                         &tensor_map_kv, full_kv_barriers[stage], smem_kv[stage], c * CHUNK_D,
                         kv_head * kv_row_stride + t * BM);
                     full_kv_barriers[stage]->arrive_and_expect_tx(SMEM_KV_TILE_BYTES);
@@ -280,7 +341,7 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
         DG_TRAP_ONLY_DEVICE_ASSERT(ld_shared(tmem_ptr_in_smem) == 0);
         q_ready_barrier->wait(0);
 
-        auto instr_desc = cute::UMMA::make_instr_desc<cutlass::half_t, cutlass::half_t, float,
+        auto instr_desc = cute::UMMA::make_instr_desc<mma_input_t, mma_input_t, float,
                                                       UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
         auto runtime_instr_desc = cute::UMMA::make_runtime_instr_desc(instr_desc);
 
@@ -320,9 +381,19 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
                                     smem_kv[stage] + sw * BM * SW_K, i * UMMA_M, kk * UMMA_K);
                                 auto b_desc = make_umma_desc<cute::UMMA::Major::K, 0, SW_K, 128>(
                                     smem_q + (c * (CHUNK_D / SW_K) + sw) * QN * SW_K, 0, kk * UMMA_K);
-                                SM100_MMA_F16BF16_SS::fma(a_desc, b_desc,
-                                                          (i * kNumAccBufs + acc_buf) * kTmemColsPerWG,
-                                                          kstep, runtime_instr_desc);
+                                if constexpr (kFp8Input) {
+                                    MarscoMmaF8SsNoElect::fma(
+                                        a_desc, b_desc,
+                                        (i * kNumAccBufs + acc_buf) *
+                                            kTmemColsPerWG,
+                                        kstep, runtime_instr_desc);
+                                } else {
+                                    SM100_MMA_F16BF16_SS::fma(
+                                        a_desc, b_desc,
+                                        (i * kNumAccBufs + acc_buf) *
+                                            kTmemColsPerWG,
+                                        kstep, runtime_instr_desc);
+                                }
                             }
                         }
                     }
@@ -370,6 +441,12 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
             coeff_o[r]    = valid ? origin[row] : 0.f;
             coeff_inv[r]  = valid ? inv_delta[row] : 0.f;
             coeff_gate[r] = valid ? th_bucket[row] : 0;
+#if LITETOPK_MARSCO_FP8_SCAN
+            if constexpr (kFp8Input) {
+                coeff_qscale[r] =
+                    valid ? __ldg(q_dequant_scale + row) : 0.f;
+            }
+#endif
         }
         __syncwarp();
         // Gate-reload / refresh-progress cadence in tiles. In in-scan-refresh
@@ -422,6 +499,17 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
 
             const uint32_t kv_row = t * BM + warp_kv_off + lane_idx;
             const bool kv_valid = kv_row < M;
+            float kv_scale = 1.f;
+#if LITETOPK_MARSCO_FP8_SCAN
+            if constexpr (kFp8Input) {
+                if (kv_valid) {
+                    kv_scale = __ldg(
+                        kv_dequant_scale +
+                        static_cast<uint64_t>(kv_head) * kv_row_stride +
+                    kv_row);
+                }
+            }
+#endif
 
             // Drain the accumulator in 8-column slices: bounds register
             // pressure at QN=64 (per-slice acc/x/b registers only) and is the
@@ -447,8 +535,14 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
                         #pragma unroll
                         for (uint32_t r = 0; r < 8; ++r) {
                             if (rbase + r >= logical_rows) continue;
+                            float score =
+                                *reinterpret_cast<float*>(&acc[r]);
+                            if constexpr (kFp8Input) {
+                                score *=
+                                    kv_scale * coeff_qscale[rbase + r];
+                            }
                             dense_out[static_cast<uint64_t>(grid_head * logical_rows + rbase + r) * buf_cap + kv_row] =
-                                __float2half(*reinterpret_cast<float*>(&acc[r]));
+                                __float2half(score);
                         }
                     }
                 } else {
@@ -474,7 +568,10 @@ void sm100_litetopk_ip(const uint32_t M,                     // scan bound: rows
                     // 存储值重算的是同一表达式，天然一致；fp16 候选仍需按"实际存储
                     // 值"的圆整重推桶号（不变式）——根据 store_bucket_space 圆整的
                     // 对象是 bq 还是 x。
-                    const float score = *reinterpret_cast<float*>(&acc[r]);
+                    float score = *reinterpret_cast<float*>(&acc[r]);
+                    if constexpr (kFp8Input) {
+                        score *= kv_scale * coeff_qscale[rbase + r];
+                    }
                     const float x = -score;
                     const float bq = (x - coeff_o[rbase + r]) * coeff_inv[rbase + r];
                     const int braw = static_cast<int>(bq);

@@ -1,166 +1,107 @@
 # LiteTopK
 
-LiteTopK provides CUDA implementations of sparse top-k selection for:
+LiteTopK provides B200 CUDA implementations of sparse top-k selection for:
 
-- the GLM-5 DSA prefill indexer; and
+- the GLM-5/LongCat DSA prefill indexer; and
 - 768-dimensional MS MARCO inner-product retrieval.
 
-The repository contains CUDA/Python source, vLLM patches, documentation, and
-one prebuilt LiteDSA shared object. It does not include model weights,
-benchmark datasets, recorded DSA caches, container images, or benchmark logs.
+Model weights, benchmark datasets, recorded DSA caches, container images, and
+benchmark logs are external.
 
 ## Repository layout
 
 | Path | Purpose |
 |---|---|
-| [`kernels/b200/dsa/`](kernels/b200/dsa/README.md) | B200 (SM100a) DSA indexer, recorded-cache benchmark, and Whole-DSA benchmark |
-| [`kernels/b200/dsa/flashinfer_port/`](kernels/b200/dsa/flashinfer_port/README.md) | LiteDSA grouped sparse-attention source and prebuilt module |
-| [`kernels/b200/marsco/`](kernels/b200/marsco/README.md) | B200 MS MARCO inner-product top-k |
-| [`kernels/h100/`](kernels/h100/README.md) | H100 (SM90a) source and compile check; the DSA runtime path is not validated here |
-| [`glm5_prefill/`](glm5_prefill/README.md) | Truncated-model builder, vLLM prefill runner, E2E launcher, and Python adapters |
-| [`vllm_patches/`](vllm_patches/README.md) | Python patches for vLLM v0.23.0, commit `0fc695f` |
-| [`deepgemm_patch/`](deepgemm_patch/README.md) | Compatibility patch for older DeepGEMM releases; DeepGEMM 2.5 does not need it |
+| [`kernels/b200/dsa/`](kernels/b200/dsa/) | B200 DSA indexer and LiteDSA grouped sparse-attention implementation |
+| [`kernels/b200/marsco/`](kernels/b200/marsco/) | B200 MS MARCO inner-product top-k implementation and benchmark |
+| [`glm5_prefill/`](glm5_prefill/README.md) | GLM-5.2/LongCat native-vLLM end-to-end A/B harness |
 
-## Requirements
+### `kernels/b200/dsa/`
 
-### B200 DSA and GLM prefill
+| File | Purpose |
+|---|---|
+| `dsa_litetopk.cu` | LiteTopK PyTorch CUDA extension entry |
+| `sm100_dsa_litetopk.cuh` | B200/SM100 fused score, gate, histogram and emit kernel |
+| `dense_topk_litetopk.cuh` | Exact short-sequence dense top-k selector |
+| `litedsa_jit_binding.cu` | LiteDSA TVM-FFI compilation unit (includes `litedsa.cu`) |
+| `litedsa.cu` | LiteDSA union and sparse-attention launch wrapper |
+| `litedsa_attention_sm100.cuh` | Self-contained SM100 FP8 sparse-attention kernel and helpers |
+| `litedsa_union.cuh` | Union, membership bitmap and physical-index kernels |
+| `build_litedsa.ninja.repro` | Current-machine `sm_100a` build template |
+| `LICENSE.deepseek-flashmla` | Upstream FlashMLA MIT license |
 
-- NVIDIA B200 (SM100a) and a CUDA toolkit with NVCC;
-- Python with CUDA-enabled PyTorch;
-- DeepGEMM 2.5 and its CUTLASS submodule;
-- vLLM 0.23.0 with the required
-  [repository patches](vllm_patches/README.md);
-- `safetensors`, FlashInfer, and TVM-FFI; and
-- a writable PyTorch extension build directory.
+`litedsa_attention_sm100.cuh` is derived from
+[`deepseek-ai/FlashMLA`](https://github.com/deepseek-ai/FlashMLA) commit
+`9241ae3` with local FP8 attention and membership modifications.
 
-The commands below use the `glm5-prefill` container and
-`/opt/vllm-venv/bin/python`. On another system, provide an equivalent
-environment and adjust the container and Python paths.
+### `kernels/b200/marsco/`
 
-### MS MARCO
+| File | Purpose |
+|---|---|
+| `bench_marsco_b200.py` | Dense/LiteTopK benchmark with recall and CUDA-event timing |
+| `litetopk_ops.py` | JIT loader and public `fused_ip_sparse_b200` API |
+| `litetopk_sm100_torch.cu` | PyTorch registration, sampling, scan and final selection |
+| `sm100_litetopk_marsco.cuh` | B200 UMMA/TMEM scan kernel |
+| `litetopk_select.cu`, `litetopk_select.h`, `litetopk_topk.h` | Candidate compaction and boundary selection |
 
-- B200 for the SM100 implementation, or H100 for the SM90 implementation;
-- CUDA-enabled PyTorch and NumPy;
-- compatible CUTLASS and DeepGEMM include directories; and
-- the MS MARCO query and corpus files described below.
+## Results (B200, 2026-08-02, kernel source `8ac06eb50e45`)
 
-## External inputs
+### DSA kernel-level A/B
 
-These inputs are not distributed with the repository:
+One B200, recorded GLM DSA caches, `Q=8192`, `K=2048`; medians over three
+independent runs.
 
-| Input | Required by | Required contents |
-|---|---|---|
-| `glm5_{256k,512k,768k,1m}_realtext_chunk8192.safetensors` | B200 DSA benchmark | `q_index`, `q_index_scale`, `idx_k_cache`, `idx_k_scale`, `gate_w` |
-| The same DSA caches with attention data | Whole-DSA | the fields above plus `topk_idx`, `mla_q`, `mla_kv`, and `metadata["mla"]` |
-| GLM-5 FP8 checkpoint | vLLM prefill | a checkpoint readable by the patched vLLM environment |
-| Tokenizer/configuration assets | truncated-model builder | files consumed by `build_fp8_truncated.py` |
-| Parquet prompt corpus | vLLM prefill | a string column named `text` |
-| MS MARCO data directory | retrieval benchmark | `query.fvecs` and either `base_5m_fp16_768.bin` or writable `base_5m.fvecs` |
-
-There are no scripts in this repository that download these assets or create
-the recorded DSA caches.
-
-## Build behavior
-
-The B200 DSA and MS MARCO PyTorch extensions are JIT-compiled on the first
-operator call. Running the corresponding benchmark is therefore also the
-build check. Set the documented include-directory variables before the first
-run.
-
-`kernels/b200/dsa/flashinfer_port/litedsa.so` is a prebuilt SM100,
-architecture- and ABI-specific TVM-FFI module. Rebuild it when the CUDA
-toolchain, TVM-FFI ABI, C++ ABI, or target architecture differs from the
-environment that produced it. Its source and build requirements are
-documented in the [LiteDSA guide](kernels/b200/dsa/flashinfer_port/README.md).
-
-## Reproduce the B200 DSA indexer benchmark
-
-The repository must be visible inside the container at the same path stored
-in `REPO_DIR`.
-
-```bash
-export REPO_DIR=/data01/home/ziqi.yin/litetopk_github_clone
-export DEEPGEMM_DIR=/data01/home/ziqi.yin/glm5_prefill_test/DeepGEMM
-
-docker exec \
-  -e CUDA_VISIBLE_DEVICES=3 \
-  -e PATH=/opt/vllm-venv/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin \
-  -e DEEPGEMM_DIR="$DEEPGEMM_DIR" \
-  -e DSA_CACHE_DIR=/data/dsa_caches \
-  -e LITETOPK_MODULE_DIR="$REPO_DIR/glm5_prefill/litetopk_vllm" \
-  -e LITETOPK_DSA_DIR="$REPO_DIR/kernels/b200/dsa" \
-  -w "$REPO_DIR/kernels/b200/dsa" \
-  glm5-prefill /opt/vllm-venv/bin/python bench_q8192.py
-```
-
-`bench_q8192.py` processes the 256K, 512K, 768K, and 1M cache files and
-compares the Q=8192 LiteTopK result with the official dense indexer.
-
-### Latest validated B200 result
-
-Measured on July 29, 2026 on one NVIDIA B200 with `Q=8192`, `K=2048`, the
-recorded GLM-5 caches, and the fixed numerical-FP16 specialization in this
-repository. The dense baseline is DeepGEMM `fp8_fp4_mqa_logits` followed by
-vLLM `top_k_per_row_prefill`.
-
-| KV length | Official dense | LiteTopK | Speedup | Set-overlap recall |
+| KV length | Dense (ms) | LiteTopK (ms) | Paired speedup median | Recall median |
 |---:|---:|---:|---:|---:|
-| 256K | 12.83 ms | 10.55 ms | 1.22x | 99.95% |
-| 512K | 26.12 ms | 20.37 ms | 1.28x | 99.95% |
-| 768K | 39.83 ms | 29.56 ms | 1.35x | 99.95% |
-| 1M | 52.56 ms | 39.30 ms | 1.34x | 99.95% |
+| 262,144 | 13.0469 | 10.6117 | 1.2266x | 99.9977% |
+| 524,288 | 25.8997 | 20.4716 | 1.2652x | 99.9980% |
+| 786,432 | 39.2471 | 30.0235 | 1.3084x | 99.9978% |
+| 1,048,576 | 51.8106 | 40.1796 | 1.2929x | 99.9978% |
 
-The benchmark uses five warm-up calls, then 20 timed calls at 256K/512K and
-eight at 768K/1M. LiteTopK consumes a precomputed fixed hot carry, so its timer
-covers the current indexer call but excludes construction of the carry for the
-next call. These are indexer-only observations from one validation run, not
-Whole-DSA or full-model results and not fixed pass criteria. Re-run the command
-above when changing the GPU, toolchain, input caches, or kernel configuration.
+### Native-vLLM end-to-end prefill A/B
 
-## Reproduce Whole-DSA
+Eight B200s, TP=8, chunk size 8192, FP8 KV cache, one untimed warmup, median
+of two trials; both arms produced exactly matching generated tokens.
 
-```bash
-docker exec \
-  -e CUDA_VISIBLE_DEVICES=3 \
-  -e PATH=/opt/vllm-venv/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin \
-  -e DEEPGEMM_DIR="$DEEPGEMM_DIR" \
-  -e TAGS="768k 1m" \
-  -e DSA_CACHE_DIR=/data/dsa_caches \
-  -e LITETOPK_MODULE_DIR="$REPO_DIR/glm5_prefill/litetopk_vllm" \
-  -e LITETOPK_DSA_DIR="$REPO_DIR/kernels/b200/dsa" \
-  -e LITEDSA_SO="$REPO_DIR/kernels/b200/dsa/flashinfer_port/litedsa.so" \
-  -w "$REPO_DIR/kernels/b200/dsa" \
-  glm5-prefill /opt/vllm-venv/bin/python bench_whole_dsa.py
-```
+| Model | Input tokens | MTP | Dense (s) | LiteTopK (s) | Median speedup |
+|---|---:|---:|---:|---:|---:|
+| GLM-5.2 | 1,048,512 | 5 | 151.140 | 120.513 | 1.2541x |
+| LongCat | 974,848 | 3 | 114.114 | 89.546 | 1.2744x |
 
-Whole-DSA separately times the indexer and sparse MLA attention and then adds
-the two times. It is not a fused kernel. Both attention paths consume the
-recorded cache's `topk_idx`, rather than the indices produced by the current
-LiteTopK invocation, so the attention implementations receive identical
-inputs.
+The harness writes machine-readable results to
+`glm5_prefill/results/<run-id>/summary.json` (gitignored; the runs above are
+`20260802-rerun-glm5.2` and `20260802-rerun-longcat` on the benchmark host).
 
-## Run GLM-5 end-to-end prefill
+## Reproducing
 
-First apply the appropriate [vLLM patches](vllm_patches/README.md). Then run
-the host-side launcher:
+### End-to-end prefill A/B
+
+Requires: B200s (`sm_100a`), CUDA PyTorch, DeepGEMM 2.5 with its CUTLASS
+submodule, `safetensors`/FlashInfer/TVM-FFI, a vLLM tree with the native
+LiteTopK integration, a GLM-5.2 or LongCat checkpoint, and a Parquet prompt
+corpus with a `text` column. The commands below use the `glm5-prefill`
+container; adjust paths for another environment.
 
 ```bash
+export REPO_DIR=/data01/home/ziqi.yin/litetopk
+export DEEPGEMM_DIR=/data01/home/ziqi.yin/glm5_prefill_test/DeepGEMM
+export LITETOPK_VLLM_SRC=/data01/home/ziqi.yin/vllm-litetopk-longcat
+
 cd "$REPO_DIR/glm5_prefill"
-
-MODEL=/models/glm5-fp8-16l \
-DEEPGEMM_DIR="$DEEPGEMM_DIR" \
-DEVICES=0,1,2,3 \
-TP=4 \
-LENGTHS="262144 524288" \
-./run_e2e.sh
+MODEL_FAMILY=glm5.2 REPEATS=2 ./run_e2e.sh
+MODEL_FAMILY=longcat REPEATS=2 ./run_e2e.sh
 ```
 
-`MODEL` and all other data paths must be visible inside the container. See
-the [prefill guide](glm5_prefill/README.md) for constructing a truncated
-checkpoint, running stock vLLM, and enabling the optional LiteDSA attention
-hook.
+The harness runs the dense vLLM indexer first, then the same workload with
+LiteTopK, and rejects mismatched A/B configurations or generated tokens. See
+the [prefill harness notes](glm5_prefill/README.md) for model defaults and
+result layout.
 
-## Run the B200 MS MARCO benchmark
+### MS MARCO benchmark
+
+Requires: one B200, CUDA PyTorch and NumPy, CUTLASS and DeepGEMM headers, and
+a `MARSCO_DATA` directory containing `query.fvecs` and either
+`base_5m_fp16_768.bin` or `base_5m.fvecs`.
 
 ```bash
 cd "$REPO_DIR/kernels/b200/marsco"
@@ -170,41 +111,34 @@ export LITETOPK_CUTLASS_INCLUDE=/path/to/cutlass/include
 export DSA_DEEP_GEMM_INCLUDE=/path/to/DeepGEMM/deep_gemm/include
 export TORCH_CUDA_ARCH_LIST=10.0a
 
-CUDA_VISIBLE_DEVICES=0 \
-python3 bench_marsco_b200.py --m 1000000 --k 128
+# Full corpus-size / top-k matrix:
+for m in 1000000 2000000 4000000 5000000; do
+  for k in 128 1024 4096 8192; do
+    CUDA_VISIBLE_DEVICES=0 \
+      python3 bench_marsco_b200.py --m "$m" --k "$k"
+  done
+done
 ```
 
-`--m` is required and must be a multiple of 64. The first call builds the
-SM100 PyTorch extension. The complete argument list and Python API are in the
-[B200 MS MARCO guide](kernels/b200/marsco/README.md).
+The first call JIT-builds the extension. The benchmark reports set-overlap
+recall plus dense and LiteTopK CUDA-event latency, and prints `RESULT: PASS`
+when recall is at least `0.99`.
 
-## H100 status
+### Build LiteDSA (`litedsa.so`)
 
-The repository includes SM90a DSA and MS MARCO source. The DSA source has a
-documented [`sm_90a` compile check](kernels/h100/README.md), but this
-repository does not provide a validated H100 DSA runtime path. The
-[H100 MS MARCO guide](kernels/h100/marsco/README.md) documents the runtime
-command that must be executed on an H100 host.
+The runtime loads a prebuilt LiteDSA module that is not checked in
+(architecture-, toolchain- and TVM-FFI-ABI-specific); build it with the
+template below. `build_litedsa.ninja.repro` contains current-machine absolute
+paths — adjust after migration.
 
-## Reproduction criteria
+```bash
+docker exec glm5-prefill bash -lc '
+  mkdir -p /tmp/litedsa_build /tmp/litedsa_ninja
+  cd /tmp/litedsa_ninja
+  /opt/vllm-venv/bin/ninja \
+    -f /data01/home/ziqi.yin/litetopk/kernels/b200/dsa/build_litedsa.ninja.repro
+'
+```
 
-A successful reproduction must satisfy the criteria for the selected entry:
-
-- **B200 DSA indexer:** all four recorded-cache shapes complete; index overlap
-  recall is at least `99.9%` for every shape; and there is no extension build
-  failure, fallback, candidate overflow, CUDA error, or invalid
-  boundary-metadata failure.
-- **Numerical FP16 behavior:** exact source-bucket classification is retained,
-  but ties inside the boundary bucket are selected using FP16 scores. Indices
-  tied at that boundary need not be byte-identical to the FP32 reference.
-- **Whole-DSA:** every requested tag completes without CUDA or module-loading
-  errors, and the reported `idx%` and `attn_maxdiff` values are recorded.
-  `bench_whole_dsa.py` does not impose pass thresholds for those two fields.
-- **MS MARCO:** the benchmark prints `RESULT: PASS`, which requires
-  set-overlap recall of at least `0.99`.
-- **End-to-end prefill:** the log confirms that the LiteTopK extension loaded
-  and that eligible calls did not silently use the dense fallback.
-
-Reported latency and speedup values describe only the current run. This
-repository does not define fixed performance numbers as reproduction
-criteria.
+The output is `/tmp/litedsa_build/dsa_indexer.so`; verify it exports
+`union_qm` and `masked_mla_fp8` before replacing `litedsa.so`.

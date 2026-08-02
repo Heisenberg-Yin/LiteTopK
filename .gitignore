@@ -2,3 +2,5 @@ __pycache__/
 *.py[cod]
 *.log
 glm5_prefill/prefill_results.json
+glm5_prefill/results/
+glm5_prefill/indexer_verification.json

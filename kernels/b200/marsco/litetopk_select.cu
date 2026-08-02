@@ -100,6 +100,35 @@ __device__ __forceinline__ float ft_to_float<__half>(__half v) { return __half2f
 template <>
 __device__ __forceinline__ float ft_to_float<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
 
+// float -> output dtype with the same round-to-nearest conversion used by
+// Tensor.to(dtype).  MARSCO keeps every comparison in bucket space; this
+// helper is called only at a final output store.
+template <typename T>
+__device__ __forceinline__ T ft_from_float(float v);
+template <>
+__device__ __forceinline__ float ft_from_float<float>(float v) { return v; }
+template <>
+__device__ __forceinline__ __half ft_from_float<__half>(float v) { return __float2half_rn(v); }
+template <>
+__device__ __forceinline__ __nv_bfloat16 ft_from_float<__nv_bfloat16>(float v) {
+    return __float2bfloat16_rn(v);
+}
+
+template <typename T, typename OT, bool DEBUCKET_OUTPUT>
+__device__ __forceinline__ T ft_final_output_value(
+        T bucket_value, const OT* origin, const OT* inv_delta, int row) {
+    if constexpr (!DEBUCKET_OUTPUT) {
+        return bucket_value;
+    } else {
+        // Match the former host chain, including its separate fp32 rounding
+        // points: reciprocal -> multiply -> add -> negate -> dtype cast.
+        const float delta = __fdiv_rn(1.0f, ft_to_float<OT>(inv_delta[row]));
+        float raw_x = __fmul_rn(ft_to_float<T>(bucket_value), delta);
+        raw_x = __fadd_rn(raw_x, ft_to_float<OT>(origin[row]));
+        return ft_from_float<T>(-raw_x);
+    }
+}
+
 // 单调编码的逆变换：enc -> 原始值（非 NaN 处 bit 精确还原）。用于 sort 后直接由 key 还原 value，
 //   省去回原数组 scatter-read 的 gather 步骤。
 __device__ __forceinline__ float ft_dec_to_float(uint32_t enc) {
@@ -1301,11 +1330,12 @@ __device__ __forceinline__ void ft_warp_emit(
     if (pred) { int w = base + __popc(m & lanemask); if (w < CAP) { outv[w] = v; outi[w] = id; } }
 }
 
-template <typename T>
+template <typename T, typename OT, bool DEBUCKET_OUTPUT>
 __device__ __forceinline__ void ft_warp_emit_lt_direct(
         int pred, T v, int32_t id, int lane, unsigned lanemask,
         int32_t* cnt, T* lt_outv, int32_t* lt_outi, int CAP,
-        T* final_outv, int32_t* final_outi, int K) {
+        T* final_outv, int32_t* final_outi, int K,
+        const OT* origin, const OT* inv_delta, int row) {
     unsigned m = __ballot_sync(0xffffffffu, pred);
     if (!m) return;
     int leader = __ffs(m) - 1;
@@ -1315,14 +1345,19 @@ __device__ __forceinline__ void ft_warp_emit_lt_direct(
     if (pred) {
         int w = base + __popc(m & lanemask);
         if (lt_outv && w < CAP) { lt_outv[w] = v; lt_outi[w] = id; }
-        if (final_outv && w < K) { final_outv[w] = v; final_outi[w] = id; }
+        if (final_outv && w < K) {
+            final_outv[w] =
+                ft_final_output_value<T, OT, DEBUCKET_OUTPUT>(v, origin, inv_delta, row);
+            final_outi[w] = id;
+        }
     }
 }
 
 // BUCKET_SPACE=true means `buf` holds bq=(x-o)*inv and the bucket number is
 // obtained by casting. BUCKET_SPACE=false means `buf` holds raw scores and
 // the transform is evaluated here.
-template <typename T, typename OT, int BLOCK_THREADS_, bool STAGED = false, bool BUCKET_SPACE = true>
+template <typename T, typename OT, int BLOCK_THREADS_, bool STAGED = false,
+          bool BUCKET_SPACE = true, bool DEBUCKET_OUTPUT = false>
 __global__ void flashtopk_compact_thr_kernel(
     const T* __restrict__ buf, int M, int CAP,
     const OT* __restrict__ origin_in,    // [R]
@@ -1355,7 +1390,7 @@ __global__ void flashtopk_compact_thr_kernel(
     int32_t* oi = out_idx ? (out_idx + (size_t)row * K) : nullptr;
     // BUCKET_SPACE=true：候选缓冲 `buf` 存的是扫描端算好的桶空间坐标
     // bq=(x-o)*inv，桶号只需一次 cast，无需再做减法+乘法；原始分数只在最终 K 个
-    // 输出处一次性转回（host 侧 debucket 步骤，见 litetopk_sm100_torch.cu）。
+    // 输出处一次性转回；候选/lt/eq 工作区始终保持 bucket-space 契约。
     // BUCKET_SPACE=false：`buf` 存的是原始分数 x，这里用
     // origin/inv_delta 计算桶号。
     float origin = 0.f, inv_delta = 0.f;
@@ -1480,8 +1515,10 @@ __global__ void flashtopk_compact_thr_kernel(
                         v = ve[t];
                         id = idx4 ? ids[t] : (int32_t)i;
                     }
-                    ft_warp_emit_lt_direct<T>(is_lt, v, id, lane, lanemask,
-                                               lt_cnt + row, ltv, lti, CAP, ov, oi, K);
+                    ft_warp_emit_lt_direct<T, OT, DEBUCKET_OUTPUT>(
+                        is_lt, v, id, lane, lanemask,
+                        lt_cnt + row, ltv, lti, CAP, ov, oi, K,
+                        origin_in, inv_delta_in, row);
                     ft_warp_emit<T>(is_eq, v, id, lane, lanemask, eq_cnt + row, eqv, eqi, CAP);
                 }
             }
@@ -1508,8 +1545,10 @@ __global__ void flashtopk_compact_thr_kernel(
                                   : (int32_t)i;
             }
         }
-        ft_warp_emit_lt_direct<T>(is_lt, v, id, lane, lanemask,
-                                   lt_cnt + row, ltv, lti, CAP, ov, oi, K);
+        ft_warp_emit_lt_direct<T, OT, DEBUCKET_OUTPUT>(
+            is_lt, v, id, lane, lanemask,
+            lt_cnt + row, ltv, lti, CAP, ov, oi, K,
+            origin_in, inv_delta_in, row);
         ft_warp_emit<T>(is_eq, v, id, lane, lanemask, eq_cnt + row, eqv, eqi, CAP);
     }
 }
@@ -1550,7 +1589,7 @@ __global__ void flashtopk_bucket_compact_thr_kernel(
 // 第二段 finalize：按 cnt_lt / cnt_eq 与 K 的关系决策（镜像单 block 版三分支）。
 //   lt 桶（b<th）已全优于 eq 桶（b==th），bucket 单调于 enc 保证。
 //   标准路径：lt 全 copy 到 out[0..cnt_lt)，eq 上 radix 选 K-cnt_lt 个补齐。
-template <typename T, int BLOCK_THREADS_>
+template <typename T, typename OT, int BLOCK_THREADS_, bool DEBUCKET_OUTPUT = false>
 __global__ void flashtopk_boundary_radix_kernel(
     const T* __restrict__ lt_val, const int32_t* __restrict__ lt_idx,
     const int32_t* __restrict__ lt_cnt,
@@ -1558,6 +1597,8 @@ __global__ void flashtopk_boundary_radix_kernel(
     const int32_t* __restrict__ eq_cnt,
     int CAP, int K,
     T* __restrict__ out_val, int32_t* __restrict__ out_idx,
+    const OT* __restrict__ origin,
+    const OT* __restrict__ inv_delta,
     uint32_t enc_xor
 ) {
     using namespace ftns;
@@ -1584,16 +1625,29 @@ __global__ void flashtopk_boundary_radix_kernel(
         data = ltd; idx_data = lti; n = cnt_lt; k_find = K; base = 0;
     } else if (cnt_lt + cnt_eq <= K) {
         // 候选不足（buffer 溢出截断）：lt+eq 全部 copy，剩余槽位补 0（取代 host 端 memset）。
-        for (int i = tidx; i < cnt_lt; i += BLOCK_THREADS_) { ov[i] = ltd[i]; oi[i] = lti[i]; }
+        for (int i = tidx; i < cnt_lt; i += BLOCK_THREADS_) {
+            ov[i] = ft_final_output_value<T, OT, DEBUCKET_OUTPUT>(
+                ltd[i], origin, inv_delta, row);
+            oi[i] = lti[i];
+        }
         for (int i = tidx; i < cnt_eq; i += BLOCK_THREADS_) {
-            int w = cnt_lt + i; if (w < K) { ov[w] = eqd[i]; oi[w] = eqi[i]; }
+            int w = cnt_lt + i;
+            if (w < K) {
+                ov[w] = ft_final_output_value<T, OT, DEBUCKET_OUTPUT>(
+                    eqd[i], origin, inv_delta, row);
+                oi[w] = eqi[i];
+            }
         }
         int filled = cnt_lt + cnt_eq;
         for (int i = filled + tidx; i < K; i += BLOCK_THREADS_) { oi[i] = 0; }
         return;
     } else {
         // 标准：lt 全 copy 到 out[0..cnt_lt)，eq 上 radix 选 K-cnt_lt 个补齐。
-        for (int i = tidx; i < cnt_lt; i += BLOCK_THREADS_) { ov[i] = ltd[i]; oi[i] = lti[i]; }
+        for (int i = tidx; i < cnt_lt; i += BLOCK_THREADS_) {
+            ov[i] = ft_final_output_value<T, OT, DEBUCKET_OUTPUT>(
+                ltd[i], origin, inv_delta, row);
+            oi[i] = lti[i];
+        }
         data = eqd; idx_data = eqi; n = cnt_eq; k_find = K - cnt_lt; base = cnt_lt;
     }
     __syncthreads();   // 保证 lt copy 完成（与下方共享内存使用分隔）
@@ -1665,12 +1719,20 @@ __global__ void flashtopk_boundary_radix_kernel(
         if (e < pivot) {
             int w = atomicAdd(&s_w_lt, 1);
             int pos = base + w;
-            if (pos < K) { ov[pos] = vv; oi[pos] = idx_data[i]; }
+            if (pos < K) {
+                ov[pos] = ft_final_output_value<T, OT, DEBUCKET_OUTPUT>(
+                    vv, origin, inv_delta, row);
+                oi[pos] = idx_data[i];
+            }
         } else if (e == pivot) {
             int o = atomicAdd(&s_w_eq, 1);
             if (o < eq_take) {
                 int pos = base + cnt_lt2 + o;
-                if (pos < K) { ov[pos] = vv; oi[pos] = idx_data[i]; }
+                if (pos < K) {
+                    ov[pos] = ft_final_output_value<T, OT, DEBUCKET_OUTPUT>(
+                        vv, origin, inv_delta, row);
+                    oi[pos] = idx_data[i];
+                }
             }
         }
     }
@@ -1681,7 +1743,7 @@ __global__ void flashtopk_boundary_radix_kernel(
 //   stage 2: one block per row merges chunks*K local candidates to final top-k.
 // This keeps exactness because every global top-k element must belong to its
 // chunk-local top-k set.
-template <typename T, int BLOCK_THREADS_>
+template <typename T, typename OT, int BLOCK_THREADS_, bool DEBUCKET_OUTPUT = false>
 __global__ void flashtopk_boundary_radix_partial_kernel(
     const T* __restrict__ lt_val, const int32_t* __restrict__ lt_idx,
     const int32_t* __restrict__ lt_cnt,
@@ -1691,6 +1753,8 @@ __global__ void flashtopk_boundary_radix_partial_kernel(
     T* __restrict__ part_val, int32_t* __restrict__ part_idx,
     int32_t* __restrict__ part_cnt,
     T* __restrict__ out_val, int32_t* __restrict__ out_idx,
+    const OT* __restrict__ origin,
+    const OT* __restrict__ inv_delta,
     uint32_t enc_xor
 ) {
     using namespace ftns;
@@ -1714,7 +1778,12 @@ __global__ void flashtopk_boundary_radix_partial_kernel(
     if (cnt_lt + cnt_eq <= K) {
         if (chunk == 0) {
             for (int i = tidx; i < cnt_eq; i += BLOCK_THREADS_) {
-                int w = cnt_lt + i; if (w < K) { ov[w] = eqd[i]; oi[w] = eqi[i]; }
+                int w = cnt_lt + i;
+                if (w < K) {
+                    ov[w] = ft_final_output_value<T, OT, DEBUCKET_OUTPUT>(
+                        eqd[i], origin, inv_delta, row);
+                    oi[w] = eqi[i];
+                }
             }
             int filled = cnt_lt + cnt_eq;
             for (int i = filled + tidx; i < K; i += BLOCK_THREADS_) oi[i] = 0;
@@ -1824,7 +1893,7 @@ __global__ void flashtopk_boundary_radix_partial_kernel(
     }
 }
 
-template <typename T, int BLOCK_THREADS_>
+template <typename T, typename OT, int BLOCK_THREADS_, bool DEBUCKET_OUTPUT = false>
 __global__ void flashtopk_boundary_radix_merge_kernel(
     const int32_t* __restrict__ lt_cnt,
     const int32_t* __restrict__ eq_cnt,
@@ -1832,6 +1901,8 @@ __global__ void flashtopk_boundary_radix_merge_kernel(
     const T* __restrict__ part_val, const int32_t* __restrict__ part_idx,
     const int32_t* __restrict__ part_cnt,
     T* __restrict__ out_val, int32_t* __restrict__ out_idx,
+    const OT* __restrict__ origin,
+    const OT* __restrict__ inv_delta,
     uint32_t enc_xor
 ) {
     using namespace ftns;
@@ -1878,7 +1949,11 @@ __global__ void flashtopk_boundary_radix_merge_kernel(
             if (off < n) {
                 int w = atomicAdd(&s_w_all, 1);
                 int pos = base + w;
-                if (pos < K) { ov[pos] = pv[i]; oi[pos] = pi[i]; }
+                if (pos < K) {
+                    ov[pos] = ft_final_output_value<T, OT, DEBUCKET_OUTPUT>(
+                        pv[i], origin, inv_delta, row);
+                    oi[pos] = pi[i];
+                }
             }
         }
         return;
@@ -1962,18 +2037,43 @@ __global__ void flashtopk_boundary_radix_merge_kernel(
         if (e < pivot) {
             int w = atomicAdd(&s_w_lt, 1);
             int pos = base + w;
-            if (pos < K) { ov[pos] = vv; oi[pos] = pi[i]; }
+            if (pos < K) {
+                ov[pos] = ft_final_output_value<T, OT, DEBUCKET_OUTPUT>(
+                    vv, origin, inv_delta, row);
+                oi[pos] = pi[i];
+            }
         } else if (e == pivot) {
             int o = atomicAdd(&s_w_eq, 1);
             if (o < eq_take) {
                 int pos = base + cnt_lt2 + o;
-                if (pos < K) { ov[pos] = vv; oi[pos] = pi[i]; }
+                if (pos < K) {
+                    ov[pos] = ft_final_output_value<T, OT, DEBUCKET_OUTPUT>(
+                        vv, origin, inv_delta, row);
+                    oi[pos] = pi[i];
+                }
             }
         }
     }
 }
 
-template <typename T, typename OT>
+static int flash_topk_select_thr_mb_bpr(int R, int BUF) {
+    static int s_num_sm = 0;
+    if (s_num_sm == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&s_num_sm, cudaDevAttrMultiProcessorCount, dev);
+        if (s_num_sm <= 0) s_num_sm = 108;
+    }
+    int bpr_cap =
+        (int)((BUF + ftns::FT_BLOCK_THREADS - 1) / ftns::FT_BLOCK_THREADS);
+    int target_total = s_num_sm * 16;
+    int bpr = target_total / (R > 0 ? R : 1);
+    if (bpr > bpr_cap) bpr = bpr_cap;
+    if (bpr < 1) bpr = 1;
+    return bpr;
+}
+
+template <typename T, typename OT, bool DEBUCKET_OUTPUT = false>
 void flash_topk_select_thr_mb(const T* buf, const int32_t* buf_idx, const int32_t* sample_idx,
                               int R, int BUF, int K,
                               const OT* origin, const OT* inv_delta,
@@ -1982,29 +2082,25 @@ void flash_topk_select_thr_mb(const T* buf, const int32_t* buf_idx, const int32_
                               T* lt_val, int32_t* lt_idx, int32_t* lt_cnt,
                               T* out_val, int* out_idx, cudaStream_t stream,
                               uint32_t enc_xor = 0u, int skip_zero = 0,
-                              bool bucket_space = true) {
+                              bool bucket_space = true,
+                              bool counters_preinitialized = false,
+                              T* part_val_workspace = nullptr,
+                              int32_t* part_idx_workspace = nullptr,
+                              int32_t* part_cnt_workspace = nullptr) {
     using namespace ftns;
     if (R <= 0 || K <= 0) return;
     // cand_*（eq 缓冲）与 lt_*（lt 缓冲）均由调用方（torch op 层）用 at::empty 分配并传入，
     //   走 PyTorch caching allocator 复用，无需初始化（计数器在此清零，val/idx 由有效区间界定）。
     // 仅清两个小计数器（各 R 个 int）；out_idx 的欠填兜底零值改由 finalize kernel 内补，
     //   省掉每次调用 R*K*4B（如 256*4096*4≈4MB）的 memset。
-    cudaMemsetAsync(lt_cnt, 0, sizeof(int32_t) * (size_t)R, stream);
-    cudaMemsetAsync(cand_cnt, 0, sizeof(int32_t) * (size_t)R, stream);  // eq_cnt
+    if (!counters_preinitialized) {
+        cudaMemsetAsync(lt_cnt, 0, sizeof(int32_t) * (size_t)R, stream);
+        cudaMemsetAsync(cand_cnt, 0, sizeof(int32_t) * (size_t)R, stream);  // eq_cnt
+    }
     // 动态 bpr：grid 为 dim3(bpr, R)，行维度已提供 R 路并行；bpr 只需把总 block 数补到
     //   填满 GPU 的量级即可。固定 bpr=256 在 R 较大时会产生 bpr*R 个 block 严重过订阅
     //   （如 R=256→65536 个 block，远超可驻留量），空 block 的调度成本反成瓶颈。
-    static int s_num_sm = 0;
-    if (s_num_sm == 0) {
-        int dev = 0; cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&s_num_sm, cudaDevAttrMultiProcessorCount, dev);
-        if (s_num_sm <= 0) s_num_sm = 108;
-    }
-    int bpr_cap = (int)((BUF + FT_BLOCK_THREADS - 1) / FT_BLOCK_THREADS);
-    int target_total = s_num_sm * 16;             // 约填满 GPU 的常驻 block 量级
-    int bpr = target_total / (R > 0 ? R : 1);
-    if (bpr > bpr_cap) bpr = bpr_cap;
-    if (bpr < 1) bpr = 1;
+    int bpr = flash_topk_select_thr_mb_bpr(R, BUF);
     bool use_direct_lt = (CAP >= FLASHTOPK_DIRECT_LT_MIN_CAP && K <= 256 && bpr > 1);
     dim3 grid_c(bpr, R);
     // 第一阶段：多 block 并行分桶。b<th 可直接写最终输出；b==th→eq(cand) 缓冲。
@@ -2015,7 +2111,9 @@ void flash_topk_select_thr_mb(const T* buf, const int32_t* buf_idx, const int32_
     bool host_can_vec = (sample_idx == nullptr) && ((size_t)BUF % kVecT == 0) && ((size_t)BUF % 4 == 0);
     if (!use_direct_lt && host_can_vec) {
         if (bucket_space) {
-            flashtopk_compact_thr_kernel<T, OT, FT_BLOCK_THREADS, true, true><<<grid_c, FT_BLOCK_THREADS, 0, stream>>>(
+            flashtopk_compact_thr_kernel<
+                T, OT, FT_BLOCK_THREADS, true, true, DEBUCKET_OUTPUT>
+                <<<grid_c, FT_BLOCK_THREADS, 0, stream>>>(
                 buf, BUF, CAP, origin, inv_delta, th, NB, K,
                 buf_idx, sample_idx, qcount,
                 lt_val, lt_idx,
@@ -2023,7 +2121,9 @@ void flash_topk_select_thr_mb(const T* buf, const int32_t* buf_idx, const int32_
                 nullptr, nullptr,
                 skip_zero);
         } else {
-            flashtopk_compact_thr_kernel<T, OT, FT_BLOCK_THREADS, true, false><<<grid_c, FT_BLOCK_THREADS, 0, stream>>>(
+            flashtopk_compact_thr_kernel<
+                T, OT, FT_BLOCK_THREADS, true, false, DEBUCKET_OUTPUT>
+                <<<grid_c, FT_BLOCK_THREADS, 0, stream>>>(
                 buf, BUF, CAP, origin, inv_delta, th, NB, K,
                 buf_idx, sample_idx, qcount,
                 lt_val, lt_idx,
@@ -2032,49 +2132,66 @@ void flash_topk_select_thr_mb(const T* buf, const int32_t* buf_idx, const int32_
                 skip_zero);
         }
     } else {
+        // direct-lt still mirrors b<th into lt_*: if the final threshold ever
+        // leaves cnt_lt>=K, hierarchical finalize must select from real data.
         if (bucket_space) {
-            flashtopk_compact_thr_kernel<T, OT, FT_BLOCK_THREADS, false, true><<<grid_c, FT_BLOCK_THREADS, 0, stream>>>(
+            flashtopk_compact_thr_kernel<
+                T, OT, FT_BLOCK_THREADS, false, true, DEBUCKET_OUTPUT>
+                <<<grid_c, FT_BLOCK_THREADS, 0, stream>>>(
                 buf, BUF, CAP, origin, inv_delta, th, NB, K,
                 buf_idx, sample_idx, qcount,
-                nullptr, nullptr,
+                lt_val, lt_idx,
                 lt_cnt, cand_val, cand_idx, cand_cnt,
                 out_val, out_idx,
                 skip_zero);
         } else {
-            flashtopk_compact_thr_kernel<T, OT, FT_BLOCK_THREADS, false, false><<<grid_c, FT_BLOCK_THREADS, 0, stream>>>(
+            flashtopk_compact_thr_kernel<
+                T, OT, FT_BLOCK_THREADS, false, false, DEBUCKET_OUTPUT>
+                <<<grid_c, FT_BLOCK_THREADS, 0, stream>>>(
                 buf, BUF, CAP, origin, inv_delta, th, NB, K,
                 buf_idx, sample_idx, qcount,
-                nullptr, nullptr,
+                lt_val, lt_idx,
                 lt_cnt, cand_val, cand_idx, cand_cnt,
                 out_val, out_idx,
                 skip_zero);
         }
     }
-    // 第二阶段：三分支 finalize。1M 大候选缓冲下，原单 block/row radix 并行度太低；
-    // 用 hierarchical select 把每行拆到 bpr 个 chunk 先局部 top-k，再合并局部候选。
     if (use_direct_lt) {
-        T* part_val = nullptr;
-        int32_t* part_idx = nullptr;
-        int32_t* part_cnt = nullptr;
+        const bool have_workspace =
+            part_val_workspace != nullptr && part_idx_workspace != nullptr &&
+            part_cnt_workspace != nullptr;
+        T* part_val = have_workspace ? part_val_workspace : nullptr;
+        int32_t* part_idx = have_workspace ? part_idx_workspace : nullptr;
+        int32_t* part_cnt = have_workspace ? part_cnt_workspace : nullptr;
         size_t part_items = (size_t)R * (size_t)bpr * (size_t)K;
-        cudaMallocAsync(reinterpret_cast<void**>(&part_val), part_items * sizeof(T), stream);
-        cudaMallocAsync(reinterpret_cast<void**>(&part_idx), part_items * sizeof(int32_t), stream);
-        cudaMallocAsync(reinterpret_cast<void**>(&part_cnt), (size_t)R * (size_t)bpr * sizeof(int32_t), stream);
+        if (!have_workspace) {
+            cudaMallocAsync(reinterpret_cast<void**>(&part_val), part_items * sizeof(T), stream);
+            cudaMallocAsync(reinterpret_cast<void**>(&part_idx), part_items * sizeof(int32_t), stream);
+            cudaMallocAsync(reinterpret_cast<void**>(&part_cnt), (size_t)R * (size_t)bpr * sizeof(int32_t), stream);
+        }
         dim3 grid_p(bpr, R);
-        flashtopk_boundary_radix_partial_kernel<T, FT_BLOCK_THREADS><<<grid_p, FT_BLOCK_THREADS, 0, stream>>>(
+        flashtopk_boundary_radix_partial_kernel<
+            T, OT, FT_BLOCK_THREADS, DEBUCKET_OUTPUT>
+            <<<grid_p, FT_BLOCK_THREADS, 0, stream>>>(
             lt_val, lt_idx, lt_cnt, cand_val, cand_idx, cand_cnt,
             CAP, K, bpr, part_val, part_idx, part_cnt,
-            out_val, out_idx, enc_xor);
-        flashtopk_boundary_radix_merge_kernel<T, FT_BLOCK_THREADS><<<R, FT_BLOCK_THREADS, 0, stream>>>(
+            out_val, out_idx, origin, inv_delta, enc_xor);
+        flashtopk_boundary_radix_merge_kernel<
+            T, OT, FT_BLOCK_THREADS, DEBUCKET_OUTPUT>
+            <<<R, FT_BLOCK_THREADS, 0, stream>>>(
             lt_cnt, cand_cnt, CAP, K, bpr, part_val, part_idx, part_cnt,
-            out_val, out_idx, enc_xor);
-        cudaFreeAsync(part_cnt, stream);
-        cudaFreeAsync(part_idx, stream);
-        cudaFreeAsync(part_val, stream);
+            out_val, out_idx, origin, inv_delta, enc_xor);
+        if (!have_workspace) {
+            cudaFreeAsync(part_cnt, stream);
+            cudaFreeAsync(part_idx, stream);
+            cudaFreeAsync(part_val, stream);
+        }
     } else {
-        flashtopk_boundary_radix_kernel<T, FT_BLOCK_THREADS><<<R, FT_BLOCK_THREADS, 0, stream>>>(
+        flashtopk_boundary_radix_kernel<
+            T, OT, FT_BLOCK_THREADS, DEBUCKET_OUTPUT>
+            <<<R, FT_BLOCK_THREADS, 0, stream>>>(
             lt_val, lt_idx, lt_cnt, cand_val, cand_idx, cand_cnt, CAP, K,
-            out_val, out_idx, enc_xor);
+            out_val, out_idx, origin, inv_delta, enc_xor);
     }
 }
 
@@ -2094,15 +2211,24 @@ void flash_topk_select_bucket(const T* bucket_val, const int32_t* bucket_idx,
     flashtopk_bucket_compact_thr_kernel<T, BLOCK_THREADS><<<grid_c, BLOCK_THREADS, 0, stream>>>(
         bucket_val, bucket_idx, bcount, NB, BUCKET_CAP, CAP, K, th,
         lt_val, lt_idx, lt_cnt, cand_val, cand_idx, cand_cnt);
-    flashtopk_boundary_radix_kernel<T, BLOCK_THREADS><<<R, BLOCK_THREADS, 0, stream>>>(
+    flashtopk_boundary_radix_kernel<T, T, BLOCK_THREADS, false>
+        <<<R, BLOCK_THREADS, 0, stream>>>(
         lt_val, lt_idx, lt_cnt, cand_val, cand_idx, cand_cnt, CAP, K,
-        out_val, out_idx, enc_xor);
+        out_val, out_idx, nullptr, nullptr, enc_xor);
 }
 
 } // namespace
 
 // ---- multi-block 阈值复用选择（mb）launch 包装 ------------------------------
 //   cand_*（eq 缓冲）与 lt_*（lt 缓冲）均 [R,CAP] val/idx + [R] cnt，由调用方分配。
+size_t flash_topk_select_thr_mb_direct_part_slots(int R, int BUF, int K, int CAP) {
+    if (R <= 0 || K <= 0) return 0;
+    int bpr = flash_topk_select_thr_mb_bpr(R, BUF);
+    bool use_direct_lt =
+        CAP >= FLASHTOPK_DIRECT_LT_MIN_CAP && K <= 256 && bpr > 1;
+    return use_direct_lt ? (size_t)R * (size_t)bpr : 0;
+}
+
 void launch_flash_topk_select_thr_mb_idx_fp32(
         const float* buf, const int32_t* buf_idx, const int32_t* sample_idx,
         int R, int BUF, int K, int CAP,
@@ -2110,10 +2236,22 @@ void launch_flash_topk_select_thr_mb_idx_fp32(
         const int32_t* th, const int32_t* qcount, int NB,
         float* cand_val, int32_t* cand_idx, int32_t* cand_cnt,
         float* lt_val, int32_t* lt_idx, int32_t* lt_cnt,
-        float* out_val, int* out_idx, cudaStream_t stream) {
-    flash_topk_select_thr_mb<float, float>(
-        buf, buf_idx, sample_idx, R, BUF, K, origin, inv_delta, th, qcount, NB,
-        CAP, cand_val, cand_idx, cand_cnt, lt_val, lt_idx, lt_cnt, out_val, out_idx, stream);
+        float* out_val, int* out_idx, cudaStream_t stream,
+        bool debucket_output, bool counters_preinitialized,
+        float* part_val, int32_t* part_idx, int32_t* part_cnt) {
+    if (debucket_output) {
+        flash_topk_select_thr_mb<float, float, true>(
+            buf, buf_idx, sample_idx, R, BUF, K, origin, inv_delta, th, qcount, NB,
+            CAP, cand_val, cand_idx, cand_cnt, lt_val, lt_idx, lt_cnt,
+            out_val, out_idx, stream, 0u, 0, true, counters_preinitialized,
+            part_val, part_idx, part_cnt);
+    } else {
+        flash_topk_select_thr_mb<float, float, false>(
+            buf, buf_idx, sample_idx, R, BUF, K, origin, inv_delta, th, qcount, NB,
+            CAP, cand_val, cand_idx, cand_cnt, lt_val, lt_idx, lt_cnt,
+            out_val, out_idx, stream, 0u, 0, true, counters_preinitialized,
+            part_val, part_idx, part_cnt);
+    }
 }
 void launch_flash_topk_select_thr_mb_idx_fp16(
         const __half* buf, const int32_t* buf_idx, const int32_t* sample_idx,
@@ -2123,19 +2261,42 @@ void launch_flash_topk_select_thr_mb_idx_fp16(
         __half* cand_val, int32_t* cand_idx, int32_t* cand_cnt,
         __half* lt_val, int32_t* lt_idx, int32_t* lt_cnt,
         __half* out_val, int* out_idx, bool coords_fp16, cudaStream_t stream,
-        int skip_zero, bool bucket_space) {
+        int skip_zero, bool bucket_space, bool debucket_output,
+        bool counters_preinitialized,
+        __half* part_val, int32_t* part_idx, int32_t* part_cnt) {
+    const bool do_debucket = debucket_output && bucket_space;
     if (coords_fp16) {
-        flash_topk_select_thr_mb<__half, __half>(
-            buf, buf_idx, sample_idx, R, BUF, K,
-            reinterpret_cast<const __half*>(origin), reinterpret_cast<const __half*>(inv_delta),
-            th, qcount, NB, CAP, cand_val, cand_idx, cand_cnt,
-            lt_val, lt_idx, lt_cnt, out_val, out_idx, stream, 0u, skip_zero, bucket_space);
+        if (do_debucket) {
+            flash_topk_select_thr_mb<__half, __half, true>(
+                buf, buf_idx, sample_idx, R, BUF, K,
+                reinterpret_cast<const __half*>(origin), reinterpret_cast<const __half*>(inv_delta),
+                th, qcount, NB, CAP, cand_val, cand_idx, cand_cnt,
+                lt_val, lt_idx, lt_cnt, out_val, out_idx, stream, 0u, skip_zero,
+                bucket_space, counters_preinitialized, part_val, part_idx, part_cnt);
+        } else {
+            flash_topk_select_thr_mb<__half, __half, false>(
+                buf, buf_idx, sample_idx, R, BUF, K,
+                reinterpret_cast<const __half*>(origin), reinterpret_cast<const __half*>(inv_delta),
+                th, qcount, NB, CAP, cand_val, cand_idx, cand_cnt,
+                lt_val, lt_idx, lt_cnt, out_val, out_idx, stream, 0u, skip_zero,
+                bucket_space, counters_preinitialized, part_val, part_idx, part_cnt);
+        }
     } else {
-        flash_topk_select_thr_mb<__half, float>(
-            buf, buf_idx, sample_idx, R, BUF, K,
-            reinterpret_cast<const float*>(origin), reinterpret_cast<const float*>(inv_delta),
-            th, qcount, NB, CAP, cand_val, cand_idx, cand_cnt,
-            lt_val, lt_idx, lt_cnt, out_val, out_idx, stream, 0u, skip_zero, bucket_space);
+        if (do_debucket) {
+            flash_topk_select_thr_mb<__half, float, true>(
+                buf, buf_idx, sample_idx, R, BUF, K,
+                reinterpret_cast<const float*>(origin), reinterpret_cast<const float*>(inv_delta),
+                th, qcount, NB, CAP, cand_val, cand_idx, cand_cnt,
+                lt_val, lt_idx, lt_cnt, out_val, out_idx, stream, 0u, skip_zero,
+                bucket_space, counters_preinitialized, part_val, part_idx, part_cnt);
+        } else {
+            flash_topk_select_thr_mb<__half, float, false>(
+                buf, buf_idx, sample_idx, R, BUF, K,
+                reinterpret_cast<const float*>(origin), reinterpret_cast<const float*>(inv_delta),
+                th, qcount, NB, CAP, cand_val, cand_idx, cand_cnt,
+                lt_val, lt_idx, lt_cnt, out_val, out_idx, stream, 0u, skip_zero,
+                bucket_space, counters_preinitialized, part_val, part_idx, part_cnt);
+        }
     }
 }
 
@@ -2158,19 +2319,22 @@ void launch_flash_topk_select_thr_mb_idx_bf16(
         const int32_t* th, const int32_t* qcount, int NB,
         __nv_bfloat16* cand_val, int32_t* cand_idx, int32_t* cand_cnt,
         __nv_bfloat16* lt_val, int32_t* lt_idx, int32_t* lt_cnt,
-        __nv_bfloat16* out_val, int* out_idx, bool coords_bf16, cudaStream_t stream) {
+        __nv_bfloat16* out_val, int* out_idx, bool coords_bf16, cudaStream_t stream,
+        __nv_bfloat16* part_val, int32_t* part_idx, int32_t* part_cnt) {
     if (coords_bf16) {
         flash_topk_select_thr_mb<__nv_bfloat16, __nv_bfloat16>(
             buf, buf_idx, sample_idx, R, BUF, K,
             reinterpret_cast<const __nv_bfloat16*>(origin), reinterpret_cast<const __nv_bfloat16*>(inv_delta),
             th, qcount, NB, CAP, cand_val, cand_idx, cand_cnt,
-            lt_val, lt_idx, lt_cnt, out_val, out_idx, stream);
+            lt_val, lt_idx, lt_cnt, out_val, out_idx, stream, 0u, 0, true, false,
+            part_val, part_idx, part_cnt);
     } else {
         flash_topk_select_thr_mb<__nv_bfloat16, float>(
             buf, buf_idx, sample_idx, R, BUF, K,
             reinterpret_cast<const float*>(origin), reinterpret_cast<const float*>(inv_delta),
             th, qcount, NB, CAP, cand_val, cand_idx, cand_cnt,
-            lt_val, lt_idx, lt_cnt, out_val, out_idx, stream);
+            lt_val, lt_idx, lt_cnt, out_val, out_idx, stream, 0u, 0, true, false,
+            part_val, part_idx, part_cnt);
     }
 }
 

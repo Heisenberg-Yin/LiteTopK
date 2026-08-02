@@ -60,15 +60,19 @@ __global__ void litedsa_union_qm_kernel(
   const int total = G * k;
   for (int t = tid; t < total; t += kLiteDSAUnionThreads) {
     const int p = idx[base + t];
-    if (p >= 0) {
-      atomicOr(&bm[p >> 5], 1u << (p & 31));
-      atomicOr(&summary[(p >> 10) >> 5], 1u << ((p >> 10) & 31));
+    if (p >= 0 && p < s_words * 32) {
+      // Publish a summary bit only when a bitmap word transitions from
+      // entirely empty. This removes the redundant summary atomic from
+      // duplicate positions and from later bits in the same word.
+      const uint32_t old = atomicOr(&bm[p >> 5], 1u << (p & 31));
+      if (old == 0u)
+        atomicOr(&summary[(p >> 10) >> 5], 1u << ((p >> 10) & 31));
     }
   }
   __syncthreads();
 
   // sweep: thread t owns one 1024-position segment (32 words)
-  const int wpt = (s_words + kLiteDSAUnionThreads - 1) / kLiteDSAUnionThreads;
+  constexpr int wpt = 32;
   const int w0 = min(tid * wpt, s_words);
   const int w1 = min(w0 + wpt, s_words);
   const bool dirty = (summary[tid >> 5] >> (tid & 31)) & 1u;
@@ -116,7 +120,7 @@ __global__ void litedsa_union_qm_kernel(
     int r = pos;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-      if ((i << 2) < wpt) {
+      if (w0 + (i << 2) < s_words) {
         sub_rank[(w0 >> 2) + i] = (uint16_t)r;
         r += csum[i];
       }
@@ -142,15 +146,21 @@ __global__ void litedsa_union_qm_kernel(
   }
   __syncthreads();  // bitmap + sub_rank stable for the rank pass
 
-  // query-major membership: accumulate rows in smem after the bitmap
-  // region, dump whole (full overwrite -> destination needs no zeroing)
+  // Query-major membership: only the ceil(count/128)*4 words that masked
+  // attention can consume are live. Accumulate and dump that prefix; the
+  // global tensor keeps its fixed capw row stride and its unused tail may
+  // remain stale.
   uint32_t* qm_s = bm + s_words;
   const int capw = cap >> 5;
-  for (int i = tid; i < G * capw; i += kLiteDSAUnionThreads) qm_s[i] = 0u;
+  const int active_capw =
+      (min(warp_sums[kLiteDSAUnionThreads / 32], cap) + 31) >> 5;
+  const int active_stride = max(4, (active_capw + 3) & ~3);
+  for (int i = tid; i < G * active_stride; i += kLiteDSAUnionThreads)
+    qm_s[i] = 0u;
   __syncthreads();
   for (int t = tid; t < total; t += kLiteDSAUnionThreads) {
     const int p = idx[base + t];
-    if (p < 0) continue;
+    if (p < 0 || p >= s_words * 32) continue;
     const int pword = p >> 5;
     const int sub = pword >> 2;
     int r = sub_rank[sub];
@@ -158,7 +168,7 @@ __global__ void litedsa_union_qm_kernel(
     r += __popc(bm[pword] & ((1u << (p & 31)) - 1u));
     if (r < cap) {
       const int q = t / k;
-      atomicOr(&qm_s[q * capw + (r >> 5)], 1u << (r & 31));
+      atomicOr(&qm_s[q * active_stride + (r >> 5)], 1u << (r & 31));
     }
   }
   __syncthreads();
@@ -166,8 +176,13 @@ __global__ void litedsa_union_qm_kernel(
     uint4* dst =
         reinterpret_cast<uint4*>(memb_qm + (long)g * G * capw);
     const uint4* src = reinterpret_cast<const uint4*>(qm_s);
-    for (int i = tid; i < (G * capw) >> 2; i += kLiteDSAUnionThreads)
-      dst[i] = src[i];
+    const int stride4 = active_stride >> 2;
+    const int dst_stride4 = capw >> 2;
+    for (int i = tid; i < G * stride4; i += kLiteDSAUnionThreads) {
+      const int q = i / stride4;
+      const int j = i - q * stride4;
+      dst[q * dst_stride4 + j] = src[i];
+    }
   }
 }
 

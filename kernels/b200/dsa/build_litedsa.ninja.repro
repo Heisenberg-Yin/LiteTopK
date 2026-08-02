@@ -8,18 +8,14 @@ nvcc_launcher =
 
 common_cflags = -DPy_LIMITED_API=0x03090000 $
     -D_GLIBCXX_USE_CXX11_ABI=1 $
-    -I/data01/home/ziqi.yin/litetopk_github_clone/kernels/b200/dsa/flashinfer_port/csrc -I/data01/home/ziqi.yin/litetopk_github_clone/kernels/b200/dsa/flashinfer_port/csrc/vendor_fmla -I/data01/home/ziqi.yin/litetopk_github_clone/kernels/b200/dsa/flashinfer_port/csrc/vendor_fmla/kerutils/include -I/data01/home/ziqi.yin/litetopk_github_clone/kernels/b200/dsa/flashinfer_port/include $
     -I/data01/home/ziqi.yin/flashinfer-litetopk/cccl/cub $
     -I/data01/home/ziqi.yin/flashinfer-litetopk/cccl/libcudacxx/include $
     -I/data01/home/ziqi.yin/flashinfer-litetopk/cccl/thrust $
     -isystem /root/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/include/python3.12 $
     -isystem $cuda_home/include $
     -isystem /opt/vllm-venv/lib/python3.12/site-packages/tvm_ffi/include $
-    -isystem /opt/vllm-venv/lib/python3.12/site-packages/tvm_ffi/include $
-    -isystem /data01/home/ziqi.yin/vllm-litetopk-longcat/.deps/cutlass-src/include -isystem /data01/home/ziqi.yin/vllm-litetopk-longcat/.deps/cutlass-src/tools/util/include -isystem /data01/home/ziqi.yin/litetopk_github_clone/kernels/b200/dsa/flashinfer_port/include -isystem /data01/home/ziqi.yin/flashinfer-litetopk/include $
+    -isystem /data01/home/ziqi.yin/vllm-litetopk-longcat/.deps/cutlass-src/include -isystem /data01/home/ziqi.yin/vllm-litetopk-longcat/.deps/cutlass-src/tools/util/include -isystem /data01/home/ziqi.yin/flashinfer-litetopk/include $
     -isystem /data01/home/ziqi.yin/flashinfer-litetopk/csrc $
-    -isystem /data01/home/ziqi.yin/vllm-litetopk-longcat/.deps/cutlass-src/include $
-    -isystem /data01/home/ziqi.yin/vllm-litetopk-longcat/.deps/cutlass-src/tools/util/include $
     -isystem /data01/home/ziqi.yin/flashinfer-litetopk/spdlog/include
 cflags = $common_cflags $
     -fPIC $
@@ -69,7 +65,7 @@ rule cuda_compile
 rule link
   command = $cxx $in $ldflags -o $out
 
-build /tmp/litedsa_build/dsa_indexer_dsa_indexer_jit_binding.cuda.o: cuda_compile /data01/home/ziqi.yin/litetopk_github_clone/kernels/b200/dsa/flashinfer_port/csrc/litedsa_jit_binding.cu
+build /tmp/litedsa_build/dsa_indexer_dsa_indexer_jit_binding.cuda.o: cuda_compile /data01/home/ziqi.yin/litetopk/kernels/b200/dsa/litedsa_jit_binding.cu
 
 build /tmp/litedsa_build/dsa_indexer.so: link /tmp/litedsa_build/dsa_indexer_dsa_indexer_jit_binding.cuda.o
 default /tmp/litedsa_build/dsa_indexer.so

@@ -13,7 +13,7 @@ Required files under ``MARSCO_DATA``:
 Usage:
     python3 bench_marsco_b200.py --m 1000000 --k 128
 
-See ``README.md`` for the CUDA include paths required by the JIT build.
+See ``../../../README.md`` for the CUDA include paths required by the JIT build.
 """
 from __future__ import annotations
 
