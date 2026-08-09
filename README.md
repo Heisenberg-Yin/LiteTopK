@@ -1,144 +1,158 @@
-# LiteTopK
+# LiteTopK / LiteDSA
 
-LiteTopK provides B200 CUDA implementations of sparse top-k selection for:
+This repository is the canonical CUDA source and benchmark workspace for the
+SM100 DSA optimizations integrated in
+`/data01/home/ziqi.yin/vllm-v026`.
 
-- the GLM-5/LongCat DSA prefill indexer; and
-- 768-dimensional MS MARCO inner-product retrieval.
+The current qualified scope is:
 
-Model weights, benchmark datasets, recorded DSA caches, container images, and
-benchmark logs are external.
+- GLM-5.2: FP8 LiteTopK indexer and grouped FP8 LiteDSA attention;
+- DeepSeek-V4-Flash: FP4 LiteTopK indexer and BF16 head-packed C128A
+  attention; and
+- B200 MS MARCO top-k kernels under `kernels/b200/marsco/`.
 
-## Repository layout
+Model weights, prompt data, container images, cache dumps, generated shared
+objects, and E2E result logs are machine-local artifacts rather than source.
+
+## Layout
 
 | Path | Purpose |
 |---|---|
-| [`kernels/b200/dsa/`](kernels/b200/dsa/) | B200 DSA indexer and LiteDSA grouped sparse-attention implementation |
-| [`kernels/b200/marsco/`](kernels/b200/marsco/) | B200 MS MARCO inner-product top-k implementation and benchmark |
-| [`glm5_prefill/`](glm5_prefill/README.md) | GLM-5.2/LongCat native-vLLM end-to-end A/B harness |
+| [`kernels/b200/dsa/`](kernels/b200/dsa/README.md) | Canonical LiteTopK, generic FP8 LiteDSA, and DSV4 packed-attention sources |
+| [`e2e/`](e2e/README.md) | Reproducible GLM-5.2 and DSV4 four-arm vLLM benchmark |
+| `kernels/b200/marsco/` | B200 MS MARCO top-k implementation and benchmark |
 
-### `kernels/b200/dsa/`
+The former repository-local `glm5_prefill/` tree has been removed; `e2e/` is
+the only maintained benchmark entry point. The separately mounted
+`/data01/home/ziqi.yin/glm5_prefill_test` directory is used only for machine-local
+build artifacts, caches, and DeepGEMM, not as benchmark source of truth.
 
-| File | Purpose |
+## Source-of-truth mapping
+
+Production vLLM uses vendored copies. The following files must remain
+byte-identical to their canonical counterparts.
+
+| Canonical source | vLLM source |
 |---|---|
-| `dsa_litetopk.cu` | LiteTopK PyTorch CUDA extension entry |
-| `sm100_dsa_litetopk.cuh` | B200/SM100 fused score, gate, histogram and emit kernel |
-| `dense_topk_litetopk.cuh` | Exact short-sequence dense top-k selector |
-| `litedsa_jit_binding.cu` | LiteDSA TVM-FFI compilation unit (includes `litedsa.cu`) |
-| `litedsa.cu` | LiteDSA union and sparse-attention launch wrapper |
-| `litedsa_attention_sm100.cuh` | Self-contained SM100 FP8 sparse-attention kernel and helpers |
-| `litedsa_union.cuh` | Union, membership bitmap and physical-index kernels |
-| `build_litedsa.ninja.repro` | Current-machine `sm_100a` build template |
-| `LICENSE.deepseek-flashmla` | Upstream FlashMLA MIT license |
+| `kernels/b200/dsa/{dsa_litetopk.cu,sm100_dsa_litetopk.cuh,dense_topk_litetopk.cuh}` | `vllm-v026/csrc/libtorch_stable/attention/dsa/latest/` |
+| `kernels/b200/dsa/litedsa_attention_sm100.cuh` | `vllm-v026/csrc/libtorch_stable/attention/dsa/vendor_fmla/sm100/prefill/sparse/fwd/head128_fp8/phase1.cuh` |
+| `kernels/b200/dsa/litedsa_union.cuh` | `vllm-v026/csrc/libtorch_stable/attention/dsa/include/flashinfer/litedsa/litedsa_union.cuh` |
+| `kernels/b200/dsa/{litedsa_attention_sm100_dsv4.cuh,litedsa_dsv4.cu,litedsa_dsv4_atoms.cuh,litedsa_dsv4_binding.cu}` | `vllm-v026/csrc/libtorch_stable/attention/dsa/dsv4_packed/` |
 
-`litedsa_attention_sm100.cuh` is derived from
-[`deepseek-ai/FlashMLA`](https://github.com/deepseek-ai/FlashMLA) commit
-`9241ae3` with local FP8 attention and membership modifications.
+The generic `litedsa.cu` translation units intentionally differ. The
+canonical file exports TVM-FFI operations for standalone iteration; the vLLM
+file registers the same kernels through the stable Torch ABI.
 
-### `kernels/b200/marsco/`
+Current LiteTopK source ID: `edd074998b45`.
 
-| File | Purpose |
-|---|---|
-| `bench_marsco_b200.py` | Dense/LiteTopK benchmark with recall and CUDA-event timing |
-| `litetopk_ops.py` | JIT loader and public `fused_ip_sparse_b200` API |
-| `litetopk_sm100_torch.cu` | PyTorch registration, sampling, scan and final selection |
-| `sm100_litetopk_marsco.cuh` | B200 UMMA/TMEM scan kernel |
-| `litetopk_select.cu`, `litetopk_select.h`, `litetopk_topk.h` | Candidate compaction and boundary selection |
+## Kernel roles
 
-## Results (B200, 2026-08-02, kernel source `8ac06eb50e45`)
+### LiteTopK
 
-### DSA kernel-level A/B
+The indexer kernel scores the long suffix and emits a conservative candidate
+set, then an exact selector returns the requested top-k. The same source
+contains the qualified H32/BQ4 FP8 path used by GLM-5.2 and the H64/BQ2 FP4
+path used by DSV4. Dense crossover, overflow fallback, status checks, and the
+8192/8128 query-tail paths are production behavior and are retained.
 
-One B200, recorded GLM DSA caches, `Q=8192`, `K=2048`; medians over three
-independent runs.
+### Generic FP8 LiteDSA
 
-| KV length | Dense (ms) | LiteTopK (ms) | Paired speedup median | Recall median |
-|---:|---:|---:|---:|---:|
-| 262,144 | 13.0469 | 10.6117 | 1.2266x | 99.9977% |
-| 524,288 | 25.8997 | 20.4716 | 1.2652x | 99.9980% |
-| 786,432 | 39.2471 | 30.0235 | 1.3084x | 99.9978% |
-| 1,048,576 | 51.8106 | 40.1796 | 1.2929x | 99.9978% |
+For GLM-5.2, adjacent query tokens are grouped so their local heads fill one
+128-row SM100 attention tile. A union kernel deduplicates their top-k KV
+indices, while a query-major membership mask preserves each token's exact
+attention set. The standalone module exports:
 
-### Native-vLLM end-to-end prefill A/B
+- `union_qm`
+- `masked_mla_fp8`
 
-Eight B200s, TP=8, chunk size 8192, FP8 KV cache, one untimed warmup, median
-of two trials; both arms produced exactly matching generated tokens.
-
-| Model | Input tokens | MTP | Dense (s) | LiteTopK (s) | Median speedup |
-|---|---:|---:|---:|---:|---:|
-| GLM-5.2 | 1,048,512 | 5 | 151.140 | 120.513 | 1.2541x |
-| LongCat | 974,848 | 3 | 114.114 | 89.546 | 1.2744x |
-
-The harness writes machine-readable results to
-`glm5_prefill/results/<run-id>/summary.json` (gitignored; the runs above are
-`20260802-rerun-glm5.2` and `20260802-rerun-longcat` on the benchmark host).
-
-## Reproducing
-
-### End-to-end prefill A/B
-
-Requires: B200s (`sm_100a`), CUDA PyTorch, DeepGEMM 2.5 with its CUTLASS
-submodule, `safetensors`/FlashInfer/TVM-FFI, a vLLM tree with the native
-LiteTopK integration, a GLM-5.2 or LongCat checkpoint, and a Parquet prompt
-corpus with a `text` column. The commands below use the `glm5-prefill`
-container; adjust paths for another environment.
+Build it with:
 
 ```bash
-export REPO_DIR=/data01/home/ziqi.yin/litetopk
-export DEEPGEMM_DIR=/data01/home/ziqi.yin/glm5_prefill_test/DeepGEMM
-export LITETOPK_VLLM_SRC=/data01/home/ziqi.yin/vllm-litetopk-longcat
-
-cd "$REPO_DIR/glm5_prefill"
-MODEL_FAMILY=glm5.2 REPEATS=2 ./run_e2e.sh
-MODEL_FAMILY=longcat REPEATS=2 ./run_e2e.sh
+cd /data01/home/ziqi.yin/litetopk/kernels/b200/dsa
+PYTHON_BIN=/opt/vllm-venv/bin/python \
+CUDA_HOME=/usr/local/cuda \
+LITEDSA_SO=/tmp/litedsa_fp8_build/litedsa.so \
+./build_litedsa.sh
 ```
 
-The harness runs the dense vLLM indexer first, then the same workload with
-LiteTopK, and rejects mismatched A/B configurations or generated tokens. See
-the [prefill harness notes](glm5_prefill/README.md) for model defaults and
-result layout.
+The script discovers TVM-FFI, FlashInfer, CUTLASS, Python, and the PyTorch C++
+ABI from the selected interpreter, builds `sm_100a`, and atomically publishes
+the requested output file.
 
-### MS MARCO benchmark
+### DSV4 packed attention
 
-Requires: one B200, CUDA PyTorch and NumPy, CUTLASS and DeepGEMM headers, and
-a `MARSCO_DATA` directory containing `query.fvecs` and either
-`base_5m_fp16_768.bin` or `base_5m.fvecs`.
+DSV4 C128A layers attend a compressed prefix plus a contiguous sliding
+window. The packed BF16 kernel combines `128 / local_heads` adjacent tokens
+into one 128-row tile and represents each query with two exact ranges. It is
+independent of the FP4 LiteTopK indexer used by C4A layers.
+
+The runtime-default artifact remains in vLLM at
+`csrc/libtorch_stable/attention/dsa/dsv4_packed/dsa_dsv4.so`. Rebuild it with
+the colocated `build_dsv4.sh`; rerun `build_probe_dsv4_smem.sh` after every
+shared-memory layout change.
+
+## End-to-end benchmark
+
+The launcher runs four orthogonal arms so an attention-only speedup is not
+misreported as a LiteTopK+attention combination:
+
+| Arm | LiteTopK | GLM attention | DSV4 attention |
+|---|---:|---|---|
+| `raw` | off | stock | stock |
+| `litetopk` | on | stock | stock |
+| `litedsa` | off | grouped FP8 LiteDSA | packed BF16 C128A |
+| `combo` | on | grouped FP8 LiteDSA | packed BF16 C128A |
+
+Run the qualified 1M configurations with:
 
 ```bash
-cd "$REPO_DIR/kernels/b200/marsco"
+cd /data01/home/ziqi.yin/litetopk/e2e
 
-export MARSCO_DATA=/path/to/marsco
-export LITETOPK_CUTLASS_INCLUDE=/path/to/cutlass/include
-export DSA_DEEP_GEMM_INCLUDE=/path/to/DeepGEMM/deep_gemm/include
-export TORCH_CUDA_ARCH_LIST=10.0a
+MODEL_FAMILY=glm5.2 \
+VLLM_LITEDSA_SO=/data01/home/ziqi.yin/litetopk/kernels/b200/dsa/.codex_variants/litedsa_cuda13_b264c21c9ce1_cuda13.so \
+REPEATS=3 WARMUPS=1 ./run_e2e.sh
 
-# Full corpus-size / top-k matrix:
-for m in 1000000 2000000 4000000 5000000; do
-  for k in 128 1024 4096 8192; do
-    CUDA_VISIBLE_DEVICES=0 \
-      python3 bench_marsco_b200.py --m "$m" --k "$k"
-  done
-done
+MODEL_FAMILY=dsv4 REPEATS=3 WARMUPS=1 ./run_e2e.sh
 ```
 
-The first call JIT-builds the extension. The benchmark reports set-overlap
-recall plus dense and LiteTopK CUDA-event latency, and prints `RESULT: PASS`
-when recall is at least `0.99`.
+GLM defaults to TP8; DSV4 defaults to TP4 with expert parallel enabled across
+the four workers. Both use 1,048,512 input tokens, chunk 8192, FP8 attention
+KV, MTP, and `async_scheduling=true`.
 
-### Build LiteDSA (`litedsa.so`)
+The runner records source/SO hashes and actual arm switches. Attention arms
+must emit a post-dispatch marker, and the four-way comparator requires matched
+benchmark configuration plus identical warmup and trial token IDs. Results
+are written below `e2e/results/`, which is gitignored.
 
-The runtime loads a prebuilt LiteDSA module that is not checked in
-(architecture-, toolchain- and TVM-FFI-ABI-specific); build it with the
-template below. `build_litedsa.ninja.repro` contains current-machine absolute
-paths — adjust after migration.
+### Qualified 1M results (2026-08-09)
 
-```bash
-docker exec glm5-prefill bash -lc '
-  mkdir -p /tmp/litedsa_build /tmp/litedsa_ninja
-  cd /tmp/litedsa_ninja
-  /opt/vllm-venv/bin/ninja \
-    -f /data01/home/ziqi.yin/litetopk/kernels/b200/dsa/build_litedsa.ninja.repro
-'
-```
+All values are medians of three trials after one warmup, with asynchronous
+scheduling and expert parallel enabled.
 
-The output is `/tmp/litedsa_build/dsa_indexer.so`; verify it exports
-`union_qm` and `masked_mla_fp8` before replacing `litedsa.so`.
+| Model | raw | LiteTopK | LiteDSA | combo | raw/TopK | raw/DSA | raw/combo |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GLM-5.2 TP8+EP8 | 152.331 s | 118.668 s | 143.955 s | 109.343 s | 1.284x | 1.058x | **1.393x** |
+| DSV4 TP4+EP4 | 60.007 s | 55.779 s | 52.397 s | 48.185 s | 1.076x | 1.145x | **1.245x** |
+
+The GLM FP8 path now has one compiled policy: warm-started ring refresh, its
+daemon, and 2048 ns pacing are always active and have no runtime switches.
+The fixed-policy source (`f75dfed60674`) reproduced the combo at 109.763 s.
+See [`e2e/README.md`](e2e/README.md) for the exact arm definitions,
+candidate/status gates, artifact hashes, and DSV4 mixed CUDA 12/13 caveat.
+
+## Cleanup policy
+
+Only code with no build entry, Python binding, runtime caller, or retained
+microbenchmark is removed during source cleanup. Shape fallbacks, exact
+selectors, status/overflow handling, architecture guards, FP8/FP4 variants,
+and model-specific paths are not treated as dead merely because the current
+E2E matrix does not exercise every branch.
+
+Generated Ninja state, `.bak`/`.works*` snapshots, and stale experimental
+translation units are not canonical source. Build artifacts should live in a
+gitignored artifact directory or `/tmp` and be selected explicitly by path
+and hash for reproducible measurements.
+
+The FlashMLA-derived attention sources retain their upstream license in
+`kernels/b200/dsa/LICENSE.deepseek-flashmla` and the corresponding vendored
+vLLM directories.

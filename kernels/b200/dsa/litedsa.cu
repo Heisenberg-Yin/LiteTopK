@@ -19,9 +19,12 @@ namespace {
 constexpr float kLog2e = 1.4426950408889634f;
 inline int num_sms_of(TensorView t) {
   int dev = t.device().device_id;
+  static thread_local int cached_dev = -1;
+  static thread_local int cached_sms = 0;
+  if (dev == cached_dev) return cached_sms;
   int sms = 0;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-  return sms;
+  cached_dev = dev; cached_sms = sms; return cached_sms;
 }
 }  // namespace
 

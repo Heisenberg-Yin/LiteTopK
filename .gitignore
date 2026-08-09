@@ -1,6 +1,9 @@
 __pycache__/
 *.py[cod]
 *.log
-glm5_prefill/prefill_results.json
-glm5_prefill/results/
-glm5_prefill/indexer_verification.json
+kernels/b200/dsa/.ninja_deps
+kernels/b200/dsa/.ninja_log
+kernels/b200/dsa/.codex_variants/
+kernels/b200/dsa/litedsa.so
+kernels/b200/dsa/dsa_dsv4.so
+e2e/results/

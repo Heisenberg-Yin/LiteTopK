@@ -32,15 +32,15 @@ namespace flashinfer::litedsa {
 constexpr int kLiteDSAUnionThreads = 1024;
 
 __global__ void litedsa_union_qm_kernel(
-    const int32_t* __restrict__ idx,      // [T, k] logical, -1 invalid
-    int32_t* __restrict__ u_phys,         // [ng, cap] PHYSICAL slots out
-    int32_t* __restrict__ counts,         // [ng]
-    uint32_t* __restrict__ memb_qm,       // [ng, G, cap/32] query-major bits
-    const int32_t* __restrict__ req_pg,   // [ng] request id per group
-    const int32_t* __restrict__ btab,     // [nreq, bt_blocks] block table
-    const int bt_stride, const int bt_blocks, const int bsz,
-    const int k, const int G, const int cap, const int s_words) {
-  extern __shared__ uint32_t bm[];        // [s_words] position bitmap
+    const int32_t* __restrict__ idx,     // [T, k] logical, -1 invalid
+    int32_t* __restrict__ u_phys,        // [ng, cap] PHYSICAL slots out
+    int32_t* __restrict__ counts,        // [ng]
+    uint32_t* __restrict__ memb_qm,      // [ng, G, cap/32] query-major bits
+    const int32_t* __restrict__ req_pg,  // [ng] request id per group
+    const int32_t* __restrict__ btab,    // [nreq, bt_blocks] block table
+    const int bt_stride, const int bt_blocks, const int bsz, const int k,
+    const int G, const int cap, const int s_words) {
+  extern __shared__ uint32_t bm[];  // [s_words] position bitmap
   __shared__ uint32_t summary[kLiteDSAUnionThreads / 32];
   __shared__ int warp_sums[kLiteDSAUnionThreads / 32 + 1];
   const int g = blockIdx.x;
@@ -65,8 +65,7 @@ __global__ void litedsa_union_qm_kernel(
       // entirely empty. This removes the redundant summary atomic from
       // duplicate positions and from later bits in the same word.
       const uint32_t old = atomicOr(&bm[p >> 5], 1u << (p & 31));
-      if (old == 0u)
-        atomicOr(&summary[(p >> 10) >> 5], 1u << ((p >> 10) & 31));
+      if (old == 0u) atomicOr(&summary[(p >> 10) >> 5], 1u << ((p >> 10) & 31));
     }
   }
   __syncthreads();
@@ -84,8 +83,7 @@ __global__ void litedsa_union_qm_kernel(
     const uint4* s4 = reinterpret_cast<const uint4*>(bm);
     for (int w = w0; w + 4 <= w1; w += 4) {
       const uint4 v4 = s4[w >> 2];
-      const int c =
-          __popc(v4.x) + __popc(v4.y) + __popc(v4.z) + __popc(v4.w);
+      const int c = __popc(v4.x) + __popc(v4.y) + __popc(v4.z) + __popc(v4.w);
       csum[(w - w0) >> 2] = c;
       my += c;
     }
@@ -110,12 +108,12 @@ __global__ void litedsa_union_qm_kernel(
   }
   __syncthreads();
   int pos = warp_sums[wid] + pref - my;
-  if (tid == kLiteDSAUnionThreads - 1) counts[g] = warp_sums[kLiteDSAUnionThreads / 32];
+  if (tid == kLiteDSAUnionThreads - 1)
+    counts[g] = warp_sums[kLiteDSAUnionThreads / 32];
 
   // 4-word-granularity rank prefix table (uint16; union count <= cap <=
   // 32768 fits): shrinks the rank pass's in-segment popc loop to <=3 words
-  uint16_t* sub_rank =
-      reinterpret_cast<uint16_t*>(bm + s_words + 16 * 1024);
+  uint16_t* sub_rank = reinterpret_cast<uint16_t*>(bm + s_words + 16 * 1024);
   {
     int r = pos;
 #pragma unroll
@@ -173,8 +171,7 @@ __global__ void litedsa_union_qm_kernel(
   }
   __syncthreads();
   {
-    uint4* dst =
-        reinterpret_cast<uint4*>(memb_qm + (long)g * G * capw);
+    uint4* dst = reinterpret_cast<uint4*>(memb_qm + (long)g * G * capw);
     const uint4* src = reinterpret_cast<const uint4*>(qm_s);
     const int stride4 = active_stride >> 2;
     const int dst_stride4 = capw >> 2;

@@ -1372,13 +1372,25 @@ struct SparseAttnFwdParams {
   int h_per_q = 0;
 
   // fp8 variant only: epilogue output multiplier (V dequant scale, i.e.
-  // k_scale). The bf16 kernel ignores it.
+  // k_scale). The bf16 DSv4 kernel has no V dequant -- keep this 1.0f.
   float out_scale = 1.0f;
 
-  // Per-QUERY causal prefix bounds on the ascending union list [s_q, G]
-  // (G = h_q / h_per_q). Row r may attend list entries < bound of query
-  // r / h_per_q. Replaces membership for causal-superset semantics.
+  // Per-QUERY prefix bound on the ascending union list [s_q, G]
+  // (G = h_q / h_per_q).  Row r may attend list entries < bound of query
+  // r / h_per_q.  Replaces membership for causal-superset semantics.
+  // This IS `pref_per_q` in DSv4 terms (the two names are the same field).
   const int* topk_length_per_q = nullptr;
+
+  // DSv4 two-range mask.  When win_lo_per_q != nullptr, query g attends
+  //     union entries [0, pref_g)  UNION  [win_lo_g, win_hi_g)
+  // instead of the single prefix [0, pref_g).  Both arrays are [s_q, G]
+  // int32 in union-RANK space (not key ids).  When win_lo_per_q ==
+  // nullptr the old single-prefix behaviour is used verbatim, so the GLM
+  // path is unaffected.  The block-loop trip count then comes from
+  // params.topk_length (the per-group union length), not from the last
+  // query's prefix.
+  const int* win_lo_per_q = nullptr;  // [s_q, G]
+  const int* win_hi_per_q = nullptr;  // [s_q, G]
 
   // KV-split: q_group_div consecutive s_q rows (list slices) share ONE Q
   // row; outputs stay per-row and are LSE-merged by the caller.
@@ -1632,29 +1644,34 @@ struct MMA_Traits<SM100_MMA_F8F6F4_2x1SM_SS_NOELECT<
 
 }  // namespace cute
 
-// ---- LiteDSA SM100 FP8 kernel configuration ----
+// ---- LiteDSA SM100 DSv4 bf16 kernel configuration ----
 
 #include <math_constants.h>
 #include <cute/tensor.hpp>
 #include <cutlass/float8.h>
 
-namespace sm100::fwd::head128_fp8 {
+#include "litedsa_dsv4_atoms.cuh"  // cute::SM100_MMA_F16BF16_2x1SM_SS_NOELECT
+
+namespace sm100::fwd::head128_dsv4 {
 
 using namespace cute;
-using fp8_e4m3 = cutlass::float_e4m3_t;
 
-// fp8 variant of the masked head128 sparse prefill kernel.
-// Differences from the bf16 kernel (../head128):
-//  - q/kv/P are e4m3; both GEMMs run tcgen05 kind::f8f6f4 (2x accum steps of
-//    32 elems vs bf16's 16).
-//  - Q shrinks to 36.9KB and lives ENTIRELY in smem -> the TMEM-Q + UTCCP
-//    machinery is deleted (all-SS MMAs). TMEM only holds O and P accums.
-//  - Q/K tiles keep the 64-element column geometry but use 64B swizzle
-//    (SW64); V uses 128-element boxes with SW128 (D_V/2 = 256 = 2x128).
-//    KV therefore needs TWO tensor maps (same data, different box/swizzle).
-//  - P is stored to smem as e4m3 scaled by 448 (bake log2(448) into the
-//    softmax exponent); the 448 cancels between O and li, lse subtracts
-//    ln(448), and params.out_scale carries the V dequant scale (k_scale).
+// DeepSeek-V4 variant of the masked head128 packed sparse prefill kernel.
+// Derived from the GLM fp8 kernel (litedsa_attention_sm100.cuh) by reversing
+// its fp8-ization; the packing masking is kept and extended.
+//  - q/kv/P are bf16; both GEMMs run tcgen05 kind::f16 (K extent 16, not 32).
+//  - d_qk == d_v == 512 (no RoPE tail), so K needs no SW64 tail region.
+//  - bf16's max swizzle box is 128 B = 64 elements, so EVERY smem column
+//    tile (Q, K, V, O) is 64 elements and ONE tensor map serves K and V.
+//  - Q (64 KiB) lives entirely in smem -> no TMEM-Q / UTCCP; TMEM holds only
+//    the O and P accumulators.
+//  - B_TOPK = 64 (not 128): bf16 doubles every operand buffer and 128 would
+//    need ~354 KiB against SM100's 227 KiB cap.
+//  - P is plain bf16: no pre-scale (the fp8 kernel's log2(7) trick bought
+//    range that bf16 has for free), and params.out_scale is unused (1.0).
+//  - Masking: row r (query g = r/h_per_q) attends ascending-union entry j iff
+//        j < pref_g  ||  (win_lo_g <= j < win_hi_g)
+//    (single-prefix when win_lo_per_q == nullptr, i.e. the GLM behaviour).
 
 template <typename Shape_Q, typename TMA_Q, typename Shape_O, typename TMA_O>
 struct TmaParams {
@@ -1662,8 +1679,8 @@ struct TmaParams {
   TMA_Q tma_Q;
   Shape_O shape_O;
   TMA_O tma_O;
-  CUtensorMap tensor_map_kv;    // K gathers: box {64,1},  SWIZZLE_64B
-  CUtensorMap tensor_map_kv_v;  // V gathers: box {128,1}, SWIZZLE_128B
+  CUtensorMap
+      tensor_map_kv;  // K and V gathers: bf16 box {64,1} = 128 B, SWIZZLE_128B
 };
 
 template <int D_QK>
@@ -1673,26 +1690,20 @@ struct KernelTemplate {
   static constexpr int D_V = 512;
   static constexpr float MAX_INIT_VAL = -1e30;
 
-  static constexpr int B_H = 128;     // For 2 CTAs
-  static constexpr int B_TOPK = 128;  // For 2 CTAs
+  static constexpr int B_H = 128;  // For 2 CTAs
+  static constexpr int B_TOPK =
+      64;  // For 2 CTAs (bf16: halved to hold the smem budget)
   static constexpr int NUM_BUFS = 2;
   static constexpr int NUM_THREADS = 256 + 128 + 128;
 
-  // K pipeline split: part0 = 128 dims (one 128B gather box, early QK start),
-  // part1 = 448 (3x128B + 1x64B boxes). 128-elem SW128 boxes for the first
-  // 512 dims cut K's TMA issues from 9 to 5 per token-quad and double the
-  // DRAM request size (the 64B boxes were 10% of stall samples via
-  // mio_throttle).
+  // K pipeline split: part0 = 128 dims (2 gather boxes; lets QK start early),
+  // part1 = the remaining 384.  At bf16 the largest swizzle box is 128 B = 64
+  // elements, so every gather is a uniform 64-element box and the fp8 kernel's
+  // "SW128 bulk + SW64 rope tail" bifurcation collapses away.
   static constexpr int D_PART0 = 128;
-  static constexpr int D_PART1 = D_QK - D_PART0;  // 448 = 384(SW128) + 64(SW64)
-  static constexpr int D_SW128 = 512;             // 128-elem box region
+  static constexpr int D_PART1 = D_QK - D_PART0;  // 384
   static constexpr int NUM_P0_TILES = D_PART0 / 64, NUM_P1_TILES = D_PART1 / 64;
-
-  // P is stored as e4m3 scaled by 7 (= 448 / 2^6): the online-softmax
-  // hysteresis lets logits exceed mi by up to 6, i.e. exp2 values up to 64,
-  // so the pre-scale must leave 2^6 headroom below e4m3's 448 max.
-  static constexpr float P_SCALE_LOG2 = 2.8073549220576042f;  // log2(7)
-  static constexpr float P_SCALE_LN = 1.9459101090932196f;    // ln(7)
+  static_assert(D_PART0 % 64 == 0 && D_PART1 % 64 == 0 && D_QK % 64 == 0);
 
   // Tensor memory columns (fp32 accums only; no Q in TMEM)
   struct tmem_cols {
@@ -1704,11 +1715,12 @@ struct KernelTemplate {
     static constexpr int p1 = 320;
   };
 
-  // Q/K: 64-element column tiles, 64B swizzle (same element geometry as the
-  // bf16 kernel's SW128 tiles, so all element-offset math carries over).
+  // Q/K: 64-element column tiles.  For bf16 that is 128 B/row = SW128 (the
+  // fp8 kernel used SW64, which is 64 B = the SAME 64 elements at 1 B/elem),
+  // so every "*64" element offset downstream carries over verbatim.
   template <int NUM_TILES>
   using SmemLayoutQTiles = decltype(coalesce(
-      tile_to_shape(UMMA::Layout_K_SW64_Atom<fp8_e4m3>{},
+      tile_to_shape(UMMA::Layout_K_SW128_Atom<bf16>{},
                     Shape<Int<B_H / 2>, Int<64 * NUM_TILES>>{}, Step<_1, _2>{}),
       Shape<_1, _1>{}));
 
@@ -1722,47 +1734,37 @@ struct KernelTemplate {
 
   template <int NUM_TILES>
   using SmemLayoutKTiles = decltype(coalesce(
-      tile_to_shape(UMMA::Layout_K_SW64_Atom<fp8_e4m3>{},
+      tile_to_shape(UMMA::Layout_K_SW128_Atom<bf16>{},
                     Shape<Int<B_TOPK / 2>, Int<64 * NUM_TILES>>{},
                     Step<_1, _2>{}),
       Shape<_1, _1>{}));
 
-  // K region layouts: 128-elem SW128 tiles for dims [0, 512), one SW64 tile
-  // for the rope tail [512, 576).
-  template <int NUM_TILES128>
-  using SmemLayoutK128 = decltype(coalesce(
-      tile_to_shape(UMMA::Layout_K_SW128_Atom<fp8_e4m3>{},
-                    Shape<Int<B_TOPK / 2>, Int<128 * NUM_TILES128>>{},
-                    Step<_1, _2>{}),
-      Shape<_1, _1>{}));
-  using SmemLayoutKTail = decltype(coalesce(
-      tile_to_shape(UMMA::Layout_K_SW64_Atom<fp8_e4m3>{},
-                    Shape<Int<B_TOPK / 2>, Int<64>>{}, Step<_1, _2>{}),
-      Shape<_1, _1>{}));
+  // (SmemLayoutK128 / SmemLayoutKTail deleted: 128 bf16 = 256 B is above the
+  //  128 B swizzle ceiling, so K is uniform 64-element tiles like Q.)
 
   using SmemLayoutV = decltype(coalesce(
-      tile_to_shape(UMMA::Layout_MN_SW128_Atom<fp8_e4m3>{},
+      tile_to_shape(UMMA::Layout_MN_SW128_Atom<bf16>{},
                     Shape<Int<256>, Int<B_TOPK>>{}, Step<_2, _1>{}),
       Shape<_1, _1>{}));
 
-  // P/S: e4m3 [B_H/2, B_TOPK] per CTA, INTER (unswizzled) K-major atoms.
-  // The (8,16)-element fp8 atom is byte-identical to the bf16 (8,8) atom, so
-  // the u128 store pattern in the softmax warps mirrors the bf16 kernel's.
+  // P/S: bf16 [B_H/2, B_TOPK] per CTA, INTER (unswizzled) K-major (8,8)
+  // atoms = 16 B rows, so a thread's row is 16 B-contiguous and the softmax
+  // warps store it as u128s at column-block stride 64 u128s.
   using SmemLayoutS = decltype(coalesce(
-      tile_to_shape(UMMA::Layout_K_INTER_Atom<fp8_e4m3>{},
+      tile_to_shape(UMMA::Layout_K_INTER_Atom<bf16>{},
                     Shape<Int<B_H / 2>, Int<B_TOPK>>{}, Step<_1, _2>{}),
       Shape<_1, _1>{}));
 
   struct SharedMemoryPlan {
     union {
       struct {
-        array_aligned<fp8_e4m3, cosize_v<SmemLayoutQTiles<D_Q / 64>>> q_full;
-        array_aligned<fp8_e4m3, cosize_v<SmemLayoutKTiles<D_K / 64>>> k[2];
-        array_aligned<fp8_e4m3, cosize_v<SmemLayoutV>> v[2];
+        array_aligned<bf16, cosize_v<SmemLayoutQTiles<D_Q / 64>>> q_full;
+        array_aligned<bf16, cosize_v<SmemLayoutKTiles<D_K / 64>>> k[2];
+        array_aligned<bf16, cosize_v<SmemLayoutV>> v[2];
       } s;
       array_aligned<bf16, cosize_v<SmemLayoutO>> o;  // epilogue only
     } u;
-    array_aligned<fp8_e4m3, cosize_v<SmemLayoutS>> s[2];  // double-buffered
+    array_aligned<bf16, cosize_v<SmemLayoutS>> s[2];  // double-buffered
     char is_k_valid[NUM_BUFS][B_TOPK / 8];
     char is_kq_valid[NUM_BUFS][16][B_TOPK / 8];
     transac_bar_t bar_prologue_q;
@@ -1779,16 +1781,23 @@ struct KernelTemplate {
                               // barrier/block
   };
 
+  // SM100 opt-in dynamic smem per block is 232448 B.  bf16 @ B_TOPK=64 lands
+  // at ~215 KiB; B_TOPK=128 would need ~354 KiB, which is why it is halved.
+  static constexpr size_t kSmemBytes = sizeof(SharedMemoryPlan);
+  static_assert(sizeof(SharedMemoryPlan) <= 232448,
+                "SharedMemoryPlan exceeds the SM100 dynamic smem cap -- reduce "
+                "NUM_BUFS or B_TOPK");
+
   using TiledMMA_P = decltype(make_tiled_mma(
-      SM100_MMA_F8F6F4_2x1SM_SS_NOELECT<fp8_e4m3, fp8_e4m3, float, B_H, B_TOPK,
-                                        UMMA::Major::K, UMMA::Major::K>{}));
+      SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK,
+                                         UMMA::Major::K, UMMA::Major::K>{}));
 
   using TiledMMA_O = decltype(make_tiled_mma(
-      SM100_MMA_F8F6F4_2x1SM_SS_NOELECT<fp8_e4m3, fp8_e4m3, float, B_H, 256,
-                                        UMMA::Major::K, UMMA::Major::MN>{},
+      SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, 256,
+                                         UMMA::Major::K, UMMA::Major::MN>{},
       Layout<Shape<_1, _1, _1>>{},
-      Tile<Int<128>, Layout<Shape<_128, _2, _2>, Stride<_1, _256, _128>>, _32>{}
-      // CTA0 takes V[:, 0:256], CTA1 takes V[:, 256:512]; K-mode = 32 (8bit)
+      Tile<Int<128>, Layout<Shape<_128, _2, _2>, Stride<_1, _256, _128>>, _16>{}
+      // CTA0 takes V[:, 0:256], CTA1 takes V[:, 256:512]; K-mode = 16 (16bit)
       ));
 
   template <typename TmaParams>
@@ -1796,7 +1805,7 @@ struct KernelTemplate {
       const SparseAttnFwdParams& params, const TmaParams& tma_params);
 };
 
-}  // namespace sm100::fwd::head128_fp8
+}  // namespace sm100::fwd::head128_dsv4
 
 // ---- LiteDSA SM100 FP8 sparse-attention kernel ----
 #include <math_constants.h>
@@ -1807,9 +1816,17 @@ struct KernelTemplate {
 #include <cutlass/arch/arch.h>
 #include <cutlass/cuda_host_adapter.hpp>
 
-namespace sm100::fwd::head128_fp8 {
+namespace sm100::fwd::head128_dsv4 {
 
 using namespace cute;
+
+// Bits [lo, hi) of a 32-bit word, clamped to [0, 32); empty range -> 0.
+CUTE_DEVICE uint32_t range_mask32(int lo, int hi) {
+  lo = max(lo, 0);
+  hi = min(hi, 32);
+  if (hi <= lo) return 0u;
+  return (uint32_t)(((1ull << hi) - 1ull) & ~((1ull << lo) - 1ull));
+}
 
 CUTE_DEVICE int32x8_t ldg_256_indices(void* src_ptr) {
   int32x8_t val;
@@ -1843,8 +1860,10 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
   int topk_length = params.topk_length != nullptr
                         ? __ldg(params.topk_length + s_q_idx)
                         : params.topk;
-  if (params.topk_length_per_q != nullptr) {
-    // group's block loop runs to the LAST query's bound (= union total)
+  if (params.topk_length_per_q != nullptr && params.win_lo_per_q == nullptr) {
+    // single-prefix (GLM) mode: the group's block loop runs to the LAST
+    // query's bound, which is the union total.  In DSv4 two-range mode
+    // the union total is params.topk_length (per-group `counts`) instead.
     const int G_ = params.h_q / params.h_per_q;
     topk_length =
         __ldg(params.topk_length_per_q + (long)s_q_idx * G_ + (G_ - 1));
@@ -1857,7 +1876,6 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
     cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());
     cute::prefetch_tma_descriptor(tma_params.tma_O.get_tma_descriptor());
     cute::prefetch_tma_descriptor(&(tma_params.tensor_map_kv));
-    cute::prefetch_tma_descriptor(&(tma_params.tensor_map_kv_v));
   }
 
   extern __shared__ char wksp_buf[];
@@ -1893,7 +1911,7 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
         plan.bar_k_part1_ready[i].init(1);
         plan.bar_p_free[i].init(128 * 2);
         plan.bar_so_ready[i].init(128 * 2);
-        plan.bar_k_valid_ready[i].init(16);
+        plan.bar_k_valid_ready[i].init(B_TOPK / 8);
         plan.bar_k_valid_free[i].init(128);
       }
       fence_barrier_init();
@@ -1929,39 +1947,47 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
 
     const float2 scale =
         float2{params.sm_scale_div_log2, params.sm_scale_div_log2};
-    // e4m3 P store: thread t (and t+64) writes row t%64; its 64 values
-    // form 4 u128 (16 e4m3 each) at column-block stride 64 u128s.
-    // Per-query causal prefix bound (qlen mode): loaded once per row.
-    int row_bound = INT_MAX;
+    // bf16 P store: thread t (and t+64) writes row t%64; its B_TOPK/2
+    // values form (B_TOPK/2)/8 u128 (8 bf16 each) at column-block stride
+    // 64 u128s.
+    // Per-query mask bounds (union-rank space): loaded once per row.
+    int row_pref = INT_MAX, row_wlo = INT_MAX, row_whi = INT_MAX;
     if (params.topk_length_per_q != nullptr) {
       const int row = cta_idx * (B_H / 2) + idx_in_warpgroup % 64;
       const int G_ = params.h_q / params.h_per_q;
-      row_bound = __ldg(params.topk_length_per_q + (long)s_q_idx * G_ +
-                        row / params.h_per_q);
+      const long qoff = (long)s_q_idx * G_ + row / params.h_per_q;
+      row_pref = __ldg(params.topk_length_per_q + qoff);
+      if (params.win_lo_per_q != nullptr) {
+        row_wlo = __ldg(params.win_lo_per_q + qoff);
+        row_whi = __ldg(params.win_hi_per_q + qoff);
+      }
     }
     // Query-major membership (exact tier, no warp13 transpose): this
     // row's two mask words per block, software-pipelined one block
     // ahead like the producers' index loads.
     const uint32_t* qm_row = nullptr;
-    uint2 qm_cur, qm_nx;
+    uint32_t qm_cur = 0u,
+             qm_nx = 0u;  // B_TOPK=64: one 32-bit word per thread-half
     if (params.membership_qm != nullptr) {
       const int row = cta_idx * (B_H / 2) + idx_in_warpgroup % 64;
       const int G_ = params.h_q / params.h_per_q;
       const int capw = params.topk / 32;
       qm_row = params.membership_qm +
                ((long)s_q_idx * G_ + row / params.h_per_q) * capw +
-               (idx_in_warpgroup >= 64 ? 2 : 0);
-      qm_cur = __ldg((const uint2*)qm_row);
+               (idx_in_warpgroup >= 64 ? B_TOPK / 64 : 0);
+      qm_cur = __ldg(qm_row);
     }
+    constexpr int U128_PER_THREAD =
+        (B_TOPK / 2) * sizeof(bf16) / 16;  // = 4 at B_TOPK=64
     uint128_t* sS_base0 = (uint128_t*)plan.s[0].data() + idx_in_warpgroup % 64 +
-                          64 * ((idx_in_warpgroup / 64) * 4);
+                          64 * ((idx_in_warpgroup / 64) * U128_PER_THREAD);
     uint128_t* sS_base1 = (uint128_t*)plan.s[1].data() + idx_in_warpgroup % 64 +
-                          64 * ((idx_in_warpgroup / 64) * 4);
+                          64 * ((idx_in_warpgroup / 64) * U128_PER_THREAD);
 
     CUTE_NO_UNROLL
     for (int k = 0; k < num_k_blocks; ++k) {
       if (qm_row != nullptr && k + 1 < num_k_blocks)
-        qm_nx = __ldg((const uint2*)(qm_row + (size_t)(k + 1) * (B_TOPK / 32)));
+        qm_nx = __ldg(qm_row + (size_t)(k + 1) * (B_TOPK / 32));
       plan.bar_qk_done[k % NUM_BUFS].wait((k / NUM_BUFS) & 1);
       ku::tcgen05_after_thread_sync();
 
@@ -1979,24 +2005,27 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
         const int row = cta_idx * (B_H / 2) + idx_in_warpgroup % 64;
         kv_valid_base = plan.is_kq_valid[k % NUM_BUFS][row / params.h_per_q];
       }
-      uint32_t is_k_valid_lo =
+      // B_TOPK=64: this thread owns B_TOPK/2 = 32 columns = ONE word of
+      // the B_TOPK/8 = 8-byte validity array; lo/hi are its 16-bit halves.
+      const uint32_t kvw =
           *(uint32_t*)(kv_valid_base +
                        (idx_in_warpgroup >= 64 ? B_TOPK / 8 / 2 : 0));
-      uint32_t is_k_valid_hi =
-          *(uint32_t*)(kv_valid_base +
-                       (idx_in_warpgroup >= 64 ? B_TOPK / 8 / 2 : 0) + 4);
+      uint32_t is_k_valid_lo = kvw & 0xffffu;
+      uint32_t is_k_valid_hi = kvw >> 16;
       if (params.topk_length_per_q != nullptr) {
-        // causal prefix folded into the validity bits: two ops
-        // instead of a 64-iteration compare loop
+        // Per-query mask folded into the validity bits: entry j is
+        // attended iff j < pref || (win_lo <= j < win_hi).  Two range
+        // masks instead of a 32-iteration compare loop.
         const int abs0 = k * B_TOPK + (idx_in_warpgroup >= 64 ? B_TOPK / 2 : 0);
-        const int n = min(max(row_bound - abs0, 0), (int)(B_TOPK / 2));
-        const uint64_t pm = n >= 64 ? ~0ull : ((1ull << n) - 1ull);
-        is_k_valid_lo &= (uint32_t)pm;
-        is_k_valid_hi &= (uint32_t)(pm >> 32);
+        uint32_t pm = range_mask32(0, row_pref - abs0);
+        if (params.win_lo_per_q != nullptr)
+          pm |= range_mask32(row_wlo - abs0, row_whi - abs0);
+        is_k_valid_lo &= pm & 0xffffu;
+        is_k_valid_hi &= (pm >> 16) & 0xffffu;
       }
       if (qm_row != nullptr) {
-        is_k_valid_lo &= qm_cur.x;
-        is_k_valid_hi &= qm_cur.y;
+        is_k_valid_lo &= qm_cur & 0xffffu;
+        is_k_valid_hi &= qm_cur >> 16;
         qm_cur = qm_nx;
       }
       float* p_float = (float*)p;
@@ -2040,22 +2069,17 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
       mi = new_max;
       li *= scale_for_old;
 
-      // Calculate S = exp2(p*scale - new_max + log2(7)) as e4m3.
-      // The pre-scale cancels between O and li at the epilogue; 7
-      // leaves 2^6 headroom for the hysteresis overshoot (values can
-      // reach exp2(6)*7 = 448 = e4m3 max, never clipped).
-      // ex2 on f16x2 halves the SFU work; e4m3's 2^-3 rounding
-      // dominates half's 2^-11, so P precision is unchanged.
-      __nv_fp8x2_storage_t s8[(B_TOPK / 2) / 2];
-      float2 neg_new_max =
-          float2{-new_max + P_SCALE_LOG2, -new_max + P_SCALE_LOG2};
+      // Calculate S = exp2(p*scale - new_max) as bf16.  No pre-scale:
+      // bf16's range dwarfs the hysteresis overshoot (max exp2(6) = 64).
+      __nv_bfloat162 s16[(B_TOPK / 2) / 2];
+      float2 neg_new_max = float2{-new_max, -new_max};
       CUTE_UNROLL
       for (int i = 0; i < (B_TOPK / 2) / 2; i += 1) {
         float2 d = ku::float2_fma(p[i], scale, neg_new_max);
         d.x = exp2f(d.x);
         d.y = exp2f(d.y);
         li += d.x + d.y;
-        s8[i] = __nv_cvt_float2_to_fp8x2(d, __NV_SATFINITE, __NV_E4M3);
+        s16[i] = __float22bfloat162_rn(d);
       }
 
       // S double-buffered: wait only for the SV gemm that last
@@ -2065,8 +2089,8 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
       }
       uint128_t* sS_base = (k & 1) ? sS_base1 : sS_base0;
       CUTE_UNROLL
-      for (int i = 0; i < (B_TOPK / 2) / 16; i += 1) {
-        sS_base[64 * i] = *(uint128_t*)(s8 + i * 8);
+      for (int i = 0; i < (B_TOPK / 2) / 8; i += 1) {
+        sS_base[64 * i] = *(uint128_t*)(s16 + i * 4);  // 4 x bfloat162 = 16 B
       }
 
       // Scale O (needs SV k-1 complete; only on rescale blocks)
@@ -2111,10 +2135,10 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
     if (idx_in_warpgroup < 64) {
       int global_index =
           s_q_idx * params.h_q + cta_idx * (B_H / 2) + idx_in_warpgroup;
-      // li carries the P pre-scale; remove it from the lse
-      float cur_lse = logf(li) - P_SCALE_LN + mi * CUDART_LN2_F;
+      float cur_lse = logf(li) + mi * CUDART_LN2_F;
       cur_lse = cur_lse == -CUDART_INF_F ? +CUDART_INF_F : cur_lse;
-      params.max_logits[global_index] = real_mi * CUDART_LN2_F;
+      if (params.max_logits != nullptr)
+        params.max_logits[global_index] = real_mi * CUDART_LN2_F;
       params.lse[global_index] = cur_lse;
     }
 
@@ -2122,15 +2146,15 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
         ((num_k_blocks - 1) / NUM_BUFS) & 1);
     ku::tcgen05_after_thread_sync();
 
-    // Store O. out_scale carries the V dequant factor (k_scale); the P
-    // pre-scale cancels between the O accumulator and li.
+    // Store O.  bf16 V needs no dequant, so params.out_scale is 1.0f and
+    // there is no P pre-scale to unwind.
     float attn_sink = params.attn_sink == nullptr
                           ? -CUDART_INF_F
                           : __ldg(params.attn_sink + cta_idx * B_H / 2 +
                                   (idx_in_warpgroup % 64)) *
                                 CUDART_L2E_F;
     float output_scale =
-        __fdividef(params.out_scale, li + exp2f(attn_sink - mi + P_SCALE_LOG2));
+        __fdividef(params.out_scale, li + exp2f(attn_sink - mi));
     Tensor sO = make_tensor(make_smem_ptr(plan.u.o.data()), SmemLayoutO{});
     constexpr int B_EPI = 64;
     Tensor tma_gO = flat_divide(
@@ -2188,7 +2212,7 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
       cute::TMEM::Allocator2Sm().free(0, 512);
     }
   } else if (warpgroup_idx == 1) {
-    // Producer warps for K (fp8: 64-elem cols via the SW64 map)
+    // Producer warps for K (bf16: uniform 64-elem cols, one tensor map)
     cutlass::arch::warpgroup_reg_dealloc<96>();
     int warp_idx = cutlass::canonical_warp_idx_sync() - 4;
     constexpr int NUM_WARPS = 4,
@@ -2204,7 +2228,7 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
                            r * NUM_WARPS + warp_idx);
       CUTE_NO_UNROLL
       for (int k = 0; k < num_k_blocks; ++k) {
-        fp8_e4m3* sK_base = plan.u.s.k[k & 1].data() + warp_idx * 4 * 64;
+        bf16* sK_base = plan.u.s.k[k & 1].data() + warp_idx * 4 * 64;
         if (k + 1 < num_k_blocks) {
           CUTE_UNROLL
           for (int r = 0; r < NUM_LOCAL_ROWS_PER_WARP; ++r)
@@ -2223,33 +2247,22 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
             min_indices == params.s_kv || max_indices == -1;
         bool should_skip_tma = is_all_rows_invalid && k >= NUM_BUFS;
 
-        // 128-elem SW128 boxes for dims [0,512): smem element base of
-        // (token t, 128-chunk c) = c*(B_TOPK/2)*128 + t*128; the SW64
-        // rope tail [512,576) lives after the SW128 region.
-        fp8_e4m3* sK_tail = plan.u.s.k[k & 1].data() + (B_TOPK / 2) * D_SW128 +
-                            warp_idx * 4 * 64;
-        auto load_k128 = [&](transac_bar_t& bar, int c0, int c1) {
+        // 64-elem boxes: smem element base of (token t, 64-chunk c)
+        // = c*(B_TOPK/2)*64 + t*64, and the gmem column coordinate is
+        // c*64 (the map is BFLOAT16-typed, so coords are ELEMENTS).
+        auto load_part_ki = [&](transac_bar_t& bar, int c0, int c1) {
           CUTE_UNROLL
           for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP;
                ++local_row) {
             CUTE_UNROLL
             for (int c = c0; c < c1; ++c)
               ku::tma_gather4_cta_group_2<true>(
-                  &(tma_params.tensor_map_kv_v), bar,
-                  plan.u.s.k[k & 1].data() + c * ((B_TOPK / 2) * 128) +
-                      (warp_idx * 4 + local_row * (4 * NUM_WARPS)) * 128,
-                  c * 128, indices[local_row],
+                  &(tma_params.tensor_map_kv), bar,
+                  sK_base + local_row * (4 * NUM_WARPS) * 64 +
+                      c * ((B_TOPK / 2) * 64),
+                  c * 64, indices[local_row],
                   (int64_t)TMA::CacheHintSm90::EVICT_LAST);
           }
-        };
-        auto load_ktail = [&](transac_bar_t& bar) {
-          CUTE_UNROLL
-          for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP;
-               ++local_row)
-            ku::tma_gather4_cta_group_2<true>(
-                &(tma_params.tensor_map_kv), bar,
-                sK_tail + local_row * (4 * NUM_WARPS) * 64, D_SW128,
-                indices[local_row], (int64_t)TMA::CacheHintSm90::EVICT_LAST);
         };
 
         int cur_buf = k % NUM_BUFS;
@@ -2259,19 +2272,17 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
           plan.bar_qk_done[(k - 2) % NUM_BUFS].wait(((k - 2) / NUM_BUFS) & 1);
         }
         if (!should_skip_tma) {
-          load_k128(plan.bar_k_part0_ready[cur_buf], 0, D_PART0 / 128);
+          load_part_ki(plan.bar_k_part0_ready[cur_buf], 0, NUM_P0_TILES);
         } else {
           plan.bar_k_part0_ready[cur_buf].complete_transaction(
-              0u, NUM_LOCAL_ROWS_PER_WARP * 4 * D_PART0 * sizeof(fp8_e4m3), 1u);
+              0u, NUM_LOCAL_ROWS_PER_WARP * 4 * D_PART0 * sizeof(bf16), 1u);
         }
 
         if (!should_skip_tma) {
-          load_k128(plan.bar_k_part1_ready[cur_buf], D_PART0 / 128,
-                    D_SW128 / 128);
-          load_ktail(plan.bar_k_part1_ready[cur_buf]);
+          load_part_ki(plan.bar_k_part1_ready[cur_buf], NUM_P0_TILES, D_K / 64);
         } else {
           plan.bar_k_part1_ready[cur_buf].complete_transaction(
-              0u, NUM_LOCAL_ROWS_PER_WARP * 4 * D_PART1 * sizeof(fp8_e4m3), 1u);
+              0u, NUM_LOCAL_ROWS_PER_WARP * 4 * D_PART1 * sizeof(bf16), 1u);
         }
         CUTE_UNROLL
         for (int r = 0; r < NUM_LOCAL_ROWS_PER_WARP; ++r)
@@ -2279,7 +2290,7 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
       }
     }
   } else if (warpgroup_idx == 2) {
-    // Producer warps for V (fp8: 128-elem cols via the SW128 map; no
+    // Producer warps for V (bf16: 64-elem cols via the same map; no
     // UTCCP wait — V no longer aliases Q)
     cutlass::arch::warpgroup_reg_dealloc<96>();
     int warp_idx = cutlass::canonical_warp_idx_sync() - 8;
@@ -2293,7 +2304,7 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
         vrows[r] = __ldg((int4*)(gIndices) + r * NUM_WARPS + warp_idx);
       CUTE_NO_UNROLL
       for (int k = 0; k < num_k_blocks; ++k) {
-        fp8_e4m3* sV_base = plan.u.s.v[k & 1].data() + warp_idx * 4 * 128;
+        bf16* sV_base = plan.u.s.v[k & 1].data() + warp_idx * 4 * 64;
         if (k + 1 < num_k_blocks) {
           CUTE_UNROLL
           for (int r = 0; r < NROWS_V; ++r)
@@ -2307,12 +2318,12 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
                ++local_row) {
             int4 token_idxs = vrows[local_row];
             CUTE_UNROLL
-            for (int local_col = 0; local_col < (D_V / 2) / 128; ++local_col)
+            for (int local_col = 0; local_col < (D_V / 2) / 64; ++local_col)
               ku::tma_gather4_cta_group_2<true>(
-                  &(tma_params.tensor_map_kv_v), bar,
-                  sV_base + local_row * (4 * NUM_WARPS) * 128 +
-                      local_col * (B_TOPK * 128),
-                  local_col * 128 + (cta_idx ? 256 : 0), token_idxs,
+                  &(tma_params.tensor_map_kv), bar,
+                  sV_base + local_row * (4 * NUM_WARPS) * 64 +
+                      local_col * (B_TOPK * 64),
+                  local_col * 64 + (cta_idx ? 256 : 0), token_idxs,
                   (int64_t)TMA::CacheHintSm90::EVICT_LAST);
           }
         };
@@ -2336,7 +2347,7 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
     // MMA warp
     if (cta_idx == 0 && warp_idx == 12 && elect_one_sync()) {
       // Wait for Q (all-smem; no S->T copy)
-      plan.bar_prologue_q.arrive_and_expect_tx(B_H * D_K * sizeof(fp8_e4m3));
+      plan.bar_prologue_q.arrive_and_expect_tx(B_H * D_K * sizeof(bf16));
       plan.bar_prologue_q.wait(0);
 
       CUTE_NO_UNROLL
@@ -2353,21 +2364,15 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
                                    SmemLayoutQTiles<NUM_P0_TILES>{});
           Tensor sQ1 = make_tensor(
               make_smem_ptr(plan.u.s.q_full.data() + (B_H / 2) * D_PART0),
-              SmemLayoutQTiles<(D_SW128 - D_PART0) / 64>{});
-          Tensor sQ2 = make_tensor(
-              make_smem_ptr(plan.u.s.q_full.data() + (B_H / 2) * D_SW128),
-              SmemLayoutQTiles<1>{});
+              SmemLayoutQTiles<NUM_P1_TILES>{});
           Tensor sK0 = make_tensor(make_smem_ptr(plan.u.s.k[k & 1].data()),
-                                   SmemLayoutK128<D_PART0 / 128>{});
+                                   SmemLayoutKTiles<NUM_P0_TILES>{});
           Tensor sK1 = make_tensor(
               make_smem_ptr(plan.u.s.k[k & 1].data() + (B_TOPK / 2) * D_PART0),
-              SmemLayoutK128<(D_SW128 - D_PART0) / 128>{});
-          Tensor sK2 = make_tensor(
-              make_smem_ptr(plan.u.s.k[k & 1].data() + (B_TOPK / 2) * D_SW128),
-              SmemLayoutKTail{});
+              SmemLayoutKTiles<NUM_P1_TILES>{});
 
           plan.bar_k_part0_ready[cur_buf].arrive_and_expect_tx(
-              B_TOPK * D_PART0 * sizeof(fp8_e4m3));
+              B_TOPK * D_PART0 * sizeof(bf16));
           plan.bar_k_part0_ready[cur_buf].wait((k / NUM_BUFS) & 1);
           if (k >= NUM_BUFS) {
             plan.bar_p_free[cur_buf].wait(((k - NUM_BUFS) / NUM_BUFS) & 1);
@@ -2379,12 +2384,11 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
               plan.bar_qk_part_done[cur_buf], 1 | 2);
 
           plan.bar_k_part1_ready[cur_buf].arrive_and_expect_tx(
-              B_TOPK * D_PART1 * sizeof(fp8_e4m3));
+              B_TOPK * D_PART1 * sizeof(bf16));
           plan.bar_k_part1_ready[cur_buf].wait((k / NUM_BUFS) & 1);
           ku::tcgen05_after_thread_sync();
 
           ku::utcmma_ss(tiled_mma_P, sQ1, sK1, tP, false);
-          ku::utcmma_ss(tiled_mma_P, sQ2, sK2, tP, false);
           ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_qk_done[cur_buf],
                                                   1 | 2);
         }
@@ -2396,15 +2400,17 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
                                   SmemLayoutS{});
           Tensor sV = make_tensor(make_smem_ptr(plan.u.s.v[(k - 1) & 1].data()),
                                   SmemLayoutV{});
-          Tensor sS_divided = flat_divide(sS, Tile<Int<B_H / 2>, _64>{})(
-              _, _, _0{}, _);  // (B_H/2, 64, 2)
-          Tensor sV_divided = flat_divide(sV, Tile<Int<D_V / 2>, _64>{})(
-              _, _, _0{}, _);  // (D_V/2, 64, 2)
+          Tensor sS_divided =
+              flat_divide(sS, Tile<Int<B_H / 2>, Int<B_TOPK / 2>>{})(
+                  _, _, _0{}, _);  // (B_H/2, 32, 2)
+          Tensor sV_divided =
+              flat_divide(sV, Tile<Int<D_V / 2>, Int<B_TOPK / 2>>{})(
+                  _, _, _0{}, _);  // (D_V/2, 32, 2)
 
           plan.bar_so_ready[cur_buf].wait(((k - 1) / NUM_BUFS) & 1);
 
           plan.bar_v_part0_ready[cur_buf].arrive_and_expect_tx(
-              (B_TOPK / 2) * D_V * sizeof(fp8_e4m3));
+              (B_TOPK / 2) * D_V * sizeof(bf16));
           plan.bar_v_part0_ready[cur_buf].wait(((k - 1) / NUM_BUFS) & 1);
           ku::tcgen05_after_thread_sync();
 
@@ -2414,7 +2420,7 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
               plan.bar_sv_part_done[cur_buf], 1 | 2);
 
           plan.bar_v_part1_ready[cur_buf].arrive_and_expect_tx(
-              (B_TOPK / 2) * D_V * sizeof(fp8_e4m3));
+              (B_TOPK / 2) * D_V * sizeof(bf16));
           plan.bar_v_part1_ready[cur_buf].wait(((k - 1) / NUM_BUFS) & 1);
           ku::tcgen05_after_thread_sync();
           ku::utcmma_ss(tiled_mma_O, sS_divided(_, _, _1{}),
@@ -2425,8 +2431,8 @@ __device__ void KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(
       }
     } else if (warp_idx == 13) {
       // KV valid loading warp (+ per-query membership masks)
-      static_assert(B_TOPK == 128);
-      if (lane_idx < 16) {
+      static_assert(B_TOPK == 64);
+      if (lane_idx < B_TOPK / 8) {
         int32x8_t vind = ldg_256_indices(gIndices + lane_idx * 8);
         int32x8_t vind_nx;
         CUTE_NO_UNROLL
@@ -2487,9 +2493,8 @@ __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 2)
 
 template <int D_QK>
 void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
-  static_assert(D_QK == 576);
+  static_assert(D_QK == 512);
   using Kernel = KernelTemplate<D_QK>;
-  using fp8_e4m3 = cutlass::float_e4m3_t;
 
   KU_ASSERT(params.h_kv == 1);
   KU_ASSERT(params.topk % Kernel::B_TOPK == 0);
@@ -2500,7 +2505,7 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
       make_shape(params.h_q, params.d_qk, params.s_q / params.q_group_div);
   auto tma_Q = cute::make_tma_copy(
       SM100_TMA_2SM_LOAD_NOSPLIT{},
-      make_tensor(make_gmem_ptr((fp8_e4m3*)params.q),
+      make_tensor(make_gmem_ptr((bf16*)params.q),
                   make_layout(shape_Q, make_stride(params.stride_q_h_q, _1{},
                                                    params.stride_q_s_q))),
       (typename Kernel::template SmemLayoutQTiles<D_QK / 64>){});
@@ -2513,15 +2518,14 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
                                                    params.h_q * params.d_v))),
       (typename Kernel::template SmemLayoutOTiles<1>){});
 
-  // K gathers: 64-element boxes, 64B swizzle
-  // The two tensor maps depend only on (kv pointer, s_kv, stride); cache
-  // them per key to avoid two cuTensorMapEncodeTiled driver calls on every
-  // invocation (78 layers x every chunk in production).
+  // K and V gathers: 64-element (128 B) bf16 boxes, 128B swizzle -- one map.
+  // The map depends only on (kv pointer, s_kv, stride); cache it per key to
+  // avoid a cuTensorMapEncodeTiled driver call on every invocation.
   struct TmapCacheEntry {
     const void* kv;
     uint64_t skv;
     uint64_t stride;
-    CUtensorMap k_map, v_map;
+    CUtensorMap k_map;
   };
   static thread_local TmapCacheEntry tmap_cache[128];
   static thread_local bool tmap_valid[128] = {};
@@ -2540,31 +2544,12 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
     tensor_map_kv = tce.k_map;
   else {
     uint64_t size[2] = {D_QK, (unsigned long)params.s_kv};
-    uint64_t stride[1] = {params.stride_kv_s_kv * sizeof(fp8_e4m3)};
+    uint64_t stride[1] = {params.stride_kv_s_kv * sizeof(bf16)};
     uint32_t box_size[2] = {64, 1};
     uint32_t elem_stride[2] = {1, 1};
     CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
-        &tensor_map_kv, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
-        params.kv, size, stride, box_size, elem_stride,
-        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
-        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    KU_ASSERT(res == CUresult::CUDA_SUCCESS);
-  }
-
-  // V gathers: 128-element boxes, 128B swizzle
-  CUtensorMap tensor_map_kv_v;
-  if (tmap_hit)
-    tensor_map_kv_v = tce.v_map;
-  else {
-    uint64_t size[2] = {D_QK, (unsigned long)params.s_kv};
-    uint64_t stride[1] = {params.stride_kv_s_kv * sizeof(fp8_e4m3)};
-    uint32_t box_size[2] = {128, 1};
-    uint32_t elem_stride[2] = {1, 1};
-    CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
-        &tensor_map_kv_v, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
-        params.kv, size, stride, box_size, elem_stride,
+        &tensor_map_kv, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2, params.kv, size, stride, box_size, elem_stride,
         CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
         CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
         CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
@@ -2576,14 +2561,12 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
     tce.skv = static_cast<uint64_t>(params.s_kv);
     tce.stride = static_cast<uint64_t>(params.stride_kv_s_kv);
     tce.k_map = tensor_map_kv;
-    tce.v_map = tensor_map_kv_v;
     tmap_valid[tmap_slot] = true;
   }
 
   TmaParams<decltype(shape_Q), decltype(tma_Q), decltype(shape_O),
             decltype(tma_O)>
-      tma_params = {shape_Q, tma_Q,         shape_O,
-                    tma_O,   tensor_map_kv, tensor_map_kv_v};
+      tma_params = {shape_Q, tma_Q, shape_O, tma_O, tensor_map_kv};
   auto kernel = &sparse_attn_fwd_kernel<Kernel, decltype(tma_params)>;
 
   constexpr size_t smem_size = sizeof(typename Kernel::SharedMemoryPlan);
@@ -2601,4 +2584,4 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
       launch_params, (void*)kernel, params, tma_params));
 }
 
-}  // namespace sm100::fwd::head128_fp8
+}  // namespace sm100::fwd::head128_dsv4
