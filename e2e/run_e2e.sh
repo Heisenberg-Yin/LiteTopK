@@ -314,7 +314,7 @@ MODEL = Path(os.environ["MODEL"]).resolve()
 PARQUET = Path(
     os.environ.get(
         "PARQUET",
-        "/data01/home/ziqi.yin/glm5/train-00000-of-00002.parquet",
+        "/workspace/glm5/train-00000-of-00002.parquet",
     )
 ).resolve()
 FAMILY = os.environ.get("MODEL_FAMILY", "unknown").lower()
@@ -1428,7 +1428,7 @@ HOST_SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_DIR="${REPO_DIR:-$(dirname "$HOST_SCRIPT_DIR")}"
 CONTAINER_SCRIPT_DIR="$REPO_DIR/e2e"
 CONTAINER="${CONTAINER:-glm5-prefill}"
-LITETOPK_VLLM_SRC="${LITETOPK_VLLM_SRC:-${VLLM_SRC:-/data01/home/ziqi.yin/vllm-v026}}"
+LITETOPK_VLLM_SRC="${LITETOPK_VLLM_SRC:-${VLLM_SRC:-/workspace/vllm-v026}}"
 MODEL_FAMILY="${MODEL_FAMILY:?set MODEL_FAMILY to glm5.2 or dsv4}"
 STAMP="${STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 RESULT_DIR="${RESULT_DIR:-$HOST_SCRIPT_DIR/results/$STAMP-$MODEL_FAMILY}"
@@ -1463,7 +1463,7 @@ case "$MODEL_FAMILY" in
     ATTN_BACKEND="${ATTN_BACKEND:-FLASHINFER_MLA_SPARSE}"
     ;;
   dsv4)
-    MODEL="${MODEL:-/data01/home/ziqi.yin/models/dsv4-flash-0731}"
+    MODEL="${MODEL:-/workspace/models/dsv4-flash-0731}"
     LENGTHS="${LENGTHS:-1048512}"
     TP="${TP:-4}"
     DEVICES="${DEVICES:-0,1,2,3}"
@@ -1605,12 +1605,12 @@ run_arm() {
     -e BENCH_ARM="$arm" \
     -e MODEL_FAMILY="$MODEL_FAMILY" \
     -e MODEL="$MODEL" \
-    -e PARQUET="${PARQUET:-/data01/home/ziqi.yin/glm5/train-00000-of-00002.parquet}" \
+    -e PARQUET="${PARQUET:-/workspace/glm5/train-00000-of-00002.parquet}" \
     -e OUTPUT="$output" \
     -e VLLM_DSA_MODE="$DSA_MODE" \
     -e VLLM_LITETOPK="$LITETOPK_ENABLED" \
     -e VLLM_DSV4_PACKED_ATTN="$DSV4_PACKED_ENABLED" \
-    -e DEEPGEMM_DIR="${DEEPGEMM_DIR:-/data01/home/ziqi.yin/glm5_prefill_test/DeepGEMM}" \
+    -e DEEPGEMM_DIR="${DEEPGEMM_DIR:-/workspace/glm5_prefill_test/DeepGEMM}" \
     -e VLLM_LITETOPK_BUILD="${VLLM_LITETOPK_BUILD:-/root/.cache/vllm/litetopk_build}" \
     -e VLLM_LITETOPK_SO="${VLLM_LITETOPK_SO:-}" \
     -e VLLM_LITETOPK_SO_SHA256="${VLLM_LITETOPK_SO_SHA256:-}" \

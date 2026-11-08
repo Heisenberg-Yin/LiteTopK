@@ -1,6 +1,6 @@
 # GLM-5.2 / DSV4 四臂端到端测试
 
-本目录在同一个 `/data01/home/ziqi.yin/vllm-v026` 源码树上测试四种配置，
+本目录在同一个 `/workspace/vllm-v026` 源码树上测试四种配置，
 分别隔离 LiteTopK indexer、LiteDSA attention 及两者组合的收益。唯一入口是
 `run_e2e.sh`。
 
@@ -80,10 +80,10 @@ DSV4 结果位于 `results/formal-20260809-dsv4-1m-four-arm/`。四臂输出 tok
 ## 运行
 
 ```bash
-cd /data01/home/ziqi.yin/litetopk/e2e
+cd /workspace/litetopk/e2e
 
 MODEL_FAMILY=glm5.2 REPEATS=3 WARMUPS=1 \
-VLLM_LITEDSA_SO=/data01/home/ziqi.yin/litetopk/kernels/b200/dsa/.codex_variants/litedsa_cuda13_b264c21c9ce1_cuda13.so \
+VLLM_LITEDSA_SO=/workspace/litetopk/kernels/b200/dsa/.codex_variants/litedsa_cuda13_b264c21c9ce1_cuda13.so \
 ./run_e2e.sh
 MODEL_FAMILY=dsv4 REPEATS=3 WARMUPS=1 ./run_e2e.sh
 ```

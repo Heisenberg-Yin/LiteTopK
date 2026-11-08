@@ -2,7 +2,7 @@
 
 This repository is the canonical CUDA source and benchmark workspace for the
 SM100 DSA optimizations integrated in
-`/data01/home/ziqi.yin/vllm-v026`.
+`/workspace/vllm-v026`.
 
 The current qualified scope is:
 
@@ -14,6 +14,10 @@ The current qualified scope is:
 Model weights, prompt data, container images, cache dumps, generated shared
 objects, and E2E result logs are machine-local artifacts rather than source.
 
+Paths under `/workspace` are examples; set the corresponding environment
+variables to match your local source, model, and dataset locations. Build
+scripts use `python3` by default; set `PYTHON_BIN` to select another environment.
+
 ## Layout
 
 | Path | Purpose |
@@ -24,7 +28,7 @@ objects, and E2E result logs are machine-local artifacts rather than source.
 
 The former repository-local `glm5_prefill/` tree has been removed; `e2e/` is
 the only maintained benchmark entry point. The separately mounted
-`/data01/home/ziqi.yin/glm5_prefill_test` directory is used only for machine-local
+`/workspace/glm5_prefill_test` directory is used only for machine-local
 build artifacts, caches, and DeepGEMM, not as benchmark source of truth.
 
 ## Source-of-truth mapping
@@ -68,7 +72,7 @@ attention set. The standalone module exports:
 Build it with:
 
 ```bash
-cd /data01/home/ziqi.yin/litetopk/kernels/b200/dsa
+cd /workspace/litetopk/kernels/b200/dsa
 PYTHON_BIN=/opt/vllm-venv/bin/python \
 CUDA_HOME=/usr/local/cuda \
 LITEDSA_SO=/tmp/litedsa_fp8_build/litedsa.so \
@@ -106,10 +110,10 @@ misreported as a LiteTopK+attention combination:
 Run the qualified 1M configurations with:
 
 ```bash
-cd /data01/home/ziqi.yin/litetopk/e2e
+cd /workspace/litetopk/e2e
 
 MODEL_FAMILY=glm5.2 \
-VLLM_LITEDSA_SO=/data01/home/ziqi.yin/litetopk/kernels/b200/dsa/.codex_variants/litedsa_cuda13_b264c21c9ce1_cuda13.so \
+VLLM_LITEDSA_SO=/workspace/litetopk/kernels/b200/dsa/.codex_variants/litedsa_cuda13_b264c21c9ce1_cuda13.so \
 REPEATS=3 WARMUPS=1 ./run_e2e.sh
 
 MODEL_FAMILY=dsv4 REPEATS=3 WARMUPS=1 ./run_e2e.sh

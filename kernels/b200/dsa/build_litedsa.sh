@@ -3,7 +3,7 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PYTHON_BIN=${PYTHON_BIN:-/data01/home/ziqi.yin/vllm026-venv/bin/python}
+PYTHON_BIN=${PYTHON_BIN:-python3}
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 BUILD_DIR=${LITEDSA_BUILD_DIR:-/tmp/litedsa_fp8_build}
 OUTPUT_SO=${LITEDSA_SO:-$SCRIPT_DIR/litedsa.so}
