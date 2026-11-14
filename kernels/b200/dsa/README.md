@@ -1,19 +1,16 @@
 # B200 DSA kernels
 
-This directory is the canonical source snapshot for the SM100 DSA kernels
-vendored into `vllm-v026`.  It intentionally remains flat for now so the
-existing include graph and end-to-end tooling do not acquire path-only
-changes.  Files are grouped logically as follows.
+This directory retains the SM100 LiteDSA attention kernels and their
+standalone build scripts. The local LiteTopK indexer has been removed.
 
-## LiteTopK indexer
+For the fastest recommended LiteTopK prefill indexer implementations, use
+[vLLM #65920](https://github.com/vllm-project/vllm/pull/65920) or
+[SGLang #47469](https://github.com/sgl-project/sglang/pull/47469).
+See the [repository README](../../../README.md) for integration status,
+supported workloads, and the accuracy trade-off.
 
-- `dsa_litetopk.cu`
-- `sm100_dsa_litetopk.cuh`
-- `dense_topk_litetopk.cuh`
-
-These three files must be byte-identical to
-`vllm-v026/csrc/libtorch_stable/attention/dsa/latest/`.  The vLLM loader
-hashes all three files to form the extension source ID.
+The vendored-copy mappings below refer to the historical local
+`vllm-v026` integration, not upstream vLLM main.
 
 ## Generic FP8 LiteDSA
 
